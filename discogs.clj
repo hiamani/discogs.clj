@@ -53,19 +53,28 @@
                 :style style
                 :year year
                 :page page}
-        resp (http/get url {:query-params params :throw false})
-        body (json/parse-string (:body resp) true)
-        results (when (< 0 (:items (:pagination body)))
-                  (:results body))]
-    (assoc state :results results)))
+        resp (http/get url {:query-params params :throw false})]
+    (if (= 200 (:status resp))
+      (let [body    (json/parse-string (:body resp) true)
+            results (when (< 0 (:items (:pagination body)))
+                      (:results body))]
+        (println (:pagination body))
+        (assoc state :results results))
+      (assoc state :results nil))))
 
-(defn fetch-release! [{:keys [master_url resource_url]}]
-  (if-let [master-resp (and master_url (http/get master_url {:throw false}))]
-    (when (= (:status master-resp) 200)
-      (assoc (json/parse-string (:body master-resp) true) :master? true))
-    (let [resource-resp (http/get resource_url {:throw false})]
-      (when (= (:status resource-resp) 200)
-        (assoc (json/parse-string (:body resource-resp) true) :master? false)))))
+(defn fetch-resource! [result k]
+  (when-let [resp (some-> (get result k) (http/get {:throw false}))]
+    (when (= 200 (:status resp))
+      (assoc (json/parse-string (:body resp) true)
+             :master? (= k :master_url)))))
+
+(defn fetch-release! [result]
+  (or (fetch-resource! result :master_url)
+      (fetch-resource! result :resource_url)))
+
+(defn fetch-current-release! [{:keys [index results] :as _state}]
+  (when-let [result (nth results (dec index) nil)]
+    (fetch-release! result)))
 
 (defn advance! [{:keys [index page results] :as state}]
   (let [next-index (inc index)
@@ -74,14 +83,10 @@
       (fetch-page! (assoc state :page (inc page) :index 1))
       (assoc state :index next-index))))
 
-(defn fetch-current-release! [{:keys [index results] :as _state}]
-  (when-let [result (nth results (dec index) nil)]
-    (fetch-release! result)))
-
 ;; Display
 
 (defn print-error [s]
-  (let [divider (apply str (repeat 63 \-))]
+  (let [divider (apply str (repeat 56 \-))]
     (println divider)
     (println " [!] Error:" s)
     (println divider)))
@@ -91,10 +96,13 @@
   (println (:summary (:opts state))))
 
 (defn print-init [{:keys [page index genre style] :as _state}]
-  (println "Welcome! Querying Discogs for style"
-           (str "{" (str/capitalize style) "}")
-           "in genre"
-           (str "{" (str/capitalize genre) "}"))
+  (if style
+    (println "Welcome! Querying Discogs for style"
+             (str "{" (str/capitalize style) "}")
+             "in genre"
+             (str "{" (str/capitalize genre) "}"))
+    (println "Welcome! Querying Discogs for genre"
+             (str "{" (str/capitalize genre) "}")))
   (println "> Starting at page" (str page ", index") index)
   (println "> Press enter for next release, q to quit.")
   (println))
@@ -133,11 +141,6 @@
         (nil? (:genre state))
         (do (print-error "Please specify a genre")
             (print-summary state)
-            (System/exit 1))
-
-        (nil? (:style state))
-        (do (print-error "Please specify a style")
-            (print-summary state)
             (System/exit 1))))
 
 (defn read-loop! [state]
@@ -147,9 +150,12 @@
         (= input (int \q)) nil
 
         (= input (int \newline))
-        (let [release (fetch-current-release! state)]
-          (print-release state release)
-          (recur (advance! state)))
+        (if (some? (:results state))
+          (let [release (fetch-current-release! state)]
+            (print-release state release)
+            (recur (advance! state)))
+          (do (println "[i] No more releases!")
+              (recur state)))
 
         :else (recur state)))))
 
@@ -159,7 +165,7 @@
     (if (some? (:results state))
       (do (print-init state)
           (read-loop! state))
-      (println "No initial results"))))
+      (println "[!] No initial results!"))))
 
 ;; Init
 
