@@ -58,7 +58,6 @@
       (let [body    (json/parse-string (:body resp) true)
             results (when (< 0 (:items (:pagination body)))
                       (:results body))]
-        (println (:pagination body))
         (assoc state :results results))
       (assoc state :results nil))))
 
