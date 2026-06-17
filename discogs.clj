@@ -75,7 +75,7 @@
       (assoc state :index next-index))))
 
 (defn fetch-current-release! [{:keys [index results] :as _state}]
-  (let [result (nth results (dec index) nil)]
+  (when-let [result (nth results (dec index) nil)]
     (fetch-release! result)))
 
 ;; Display
