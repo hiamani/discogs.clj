@@ -30,9 +30,9 @@ $ ./discogs.clj
 
 ```
 [?] Press n for next release, p for previous, q to quit.
-    To navigate videos, press j to go down, k to go up
-    Press Enter to open video link in the browser
-    Press Space to play/pause audio
+    To navigate videos, press j to go down, k to go up.
+    Press Enter to open video link in the browser.
+    Press Space to play/pause audio.
 ```
 
 ### Roadmap

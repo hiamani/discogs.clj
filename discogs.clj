@@ -320,10 +320,10 @@
 (defn print-instructions [state]
   (println)
   (println (str (blue "[?]") " Press " (yellow "n") " for next release, " (yellow "p") " for previous, " (yellow "q") " to quit."))
-  (println (str "    To navigate videos, press " (yellow "j") " to go down, " (yellow "k") " to go up"))
-  (println (str "    Press " (yellow "Enter") " to open video link in the browser"))
+  (println (str "    To navigate videos, press " (yellow "j") " to go down, " (yellow "k") " to go up."))
+  (println (str "    Press " (yellow "Enter") " to open video link in the browser."))
   (when (:mpv-exists? state)
-    (println (str "    Press " (yellow "Space") " to play/pause audio"))))
+    (println (str "    Press " (yellow "Space") " to play/pause audio."))))
 
 (defn print-video [{:keys [video-index playing-index]} index video]
   (let [uri-display (str (when (= index playing-index) "▶ ") (:uri video))
