@@ -1,8 +1,12 @@
 #!/usr/bin/env bb
-(require '[babashka.http-client :as http]
+(require '[babashka.pods :as pods]
+         '[babashka.http-client :as http]
          '[cheshire.core :as json]
          '[clojure.string :as str]
-         '[clojure.tools.cli :refer [parse-opts]])
+         '[clojure.tools.cli :refer [parse-opts]]
+         '[clojure.java.browse :refer [browse-url]])
+
+(pods/load-pod 'huahaiy/datalevin "0.10.16")
 
 ;; Interact with tty
 
@@ -37,13 +41,15 @@
 (def initial-state
   (let [opts (parse-opts *command-line-args* cli-options)
         {:keys [genre style year page index]} (:options opts)]
-    {:opts opts
-     :genre genre
-     :style style
-     :year year
-     :page page
-     :index index
-     :results nil}))
+    {:opts    opts
+     :genre   genre
+     :style   style
+     :year    year
+     :page    (if (< 0 page) page 1)
+     :index   (if (< 0 index) (dec index) 0)
+     :results nil
+     :release nil
+     :video-index 0}))
 
 ;; Effects
 
@@ -71,16 +77,38 @@
   (or (fetch-resource! result :master_url)
       (fetch-resource! result :resource_url)))
 
-(defn fetch-current-release! [{:keys [index results] :as _state}]
-  (when-let [result (nth results (dec index) nil)]
-    (fetch-release! result)))
+(defn fetch-current-release! [{:keys [index results] :as state}]
+  (let [release (some-> results (nth index nil) (fetch-release!))]
+    (assoc state :release release :video-index 0)))
 
-(defn advance! [{:keys [index page results] :as state}]
+(defn forward! [{:keys [index page results] :as state}]
   (let [next-index (inc index)
-        next-page? (> next-index (count results))]
-    (if next-page?
-      (fetch-page! (assoc state :page (inc page) :index 1))
-      (assoc state :index next-index))))
+        next-page? (>= next-index (count results))]
+    (-> (if next-page?
+          (fetch-page! (assoc state :page (inc page) :index 1))
+          (assoc state :index next-index))
+        (fetch-current-release!))))
+
+(defn back! [{:keys [index page] :as state}]
+  (let [prev-index (dec index)]
+    (cond
+      (>= prev-index 0)
+      (-> state
+          (assoc :index prev-index)
+          (fetch-current-release!))
+
+      (> page 1)
+      (let [prev-state (-> state
+                           (assoc :page (dec page))
+                           (fetch-page!))]
+        (if (some? (:results prev-state))
+          (-> prev-state
+              (assoc :index (dec (count (:results prev-state))))
+              (fetch-current-release!))
+          (fetch-current-release! state)))
+
+      :else
+      (fetch-current-release! state))))
 
 ;; Display
 
@@ -102,12 +130,22 @@
              (str "{" (str/capitalize genre) "}"))
     (println "Welcome! Querying Discogs for genre"
              (str "{" (str/capitalize genre) "}")))
-  (println "> Starting at page" (str page ", index") index)
-  (println "> Press enter for next release, q to quit.")
-  (println))
+  (println "> Starting at page" (str page ", index") (inc index)))
 
-(defn print-release [{:keys [page index results] :as _state} release]
-  (let [index-of (str "(" index " of " (count results) ")")]
+(defn print-instructions []
+  (println)
+  (println "[?] Press n for next release, p for previous, q to quit.")
+  (println "    To navigate videos, press j to go up, k to go down")
+  (println "    Press Enter to open video link in the browser"))
+
+(defn bold [s]
+  (str "\033[1m" s "\033[0m"))
+
+(defn green [s]
+  (str "\033[32m" s "\033[0m"))
+
+(defn print-release [{:keys [page index results release video-index]}]
+  (let [index-of (str "(" (inc index) " of " (count results) ")")]
     (println "-----------" "Page" page index-of "-----------")
     (if release
       (do (println "Artists:" (str/join ", " (map :name (:artists release))))
@@ -117,13 +155,16 @@
           (println "Page:"    (:uri release))
           (if (seq (:videos release))
             (do (println "Videos:")
-                (doseq [video (:videos release)]
-                  (println "  -" (:title video))
-                  (println "   " (:uri video))))
+                (doseq [[i video] (map-indexed vector (:videos release))]
+                  (if (= i video-index)
+                    (do (println "  -" (green (bold (:title video))))
+                        (println "   " (green (bold (:uri video)))))
+                    (do (println "  -" (:title video))
+                        (println "   " (:uri video))))))
             (println "(No Videos)")))
-      (println "[!] No release found!"))
-    (println)))
+      (println "[!] No release found!"))))
 
+(map-indexed vector [:a :b :c])
 ;; Main
 
 (defn validate-state [{:keys [opts] :as state} cli-args]
@@ -142,27 +183,69 @@
             (print-summary state)
             (System/exit 1))))
 
+(defn clear []
+  (print "\033[2J\033[H")
+  (flush))
+
 (defn read-loop! [state]
   (loop [state state]
     (let [input (read-char)]
       (cond
         (= input (int \q)) nil
 
-        (= input (int \newline))
+        (or (= input (int \n))
+            (= input (int \p)))
         (if (some? (:results state))
-          (let [release (fetch-current-release! state)]
-            (print-release state release)
-            (recur (advance! state)))
+          (let [state' (cond (not (:started? state)) (fetch-current-release! state)
+                             (= input (int \n))      (forward! state)
+                             :else                   (back! state))
+                state' (assoc state' :started? true)]
+            (clear)
+            (print-release state')
+            (print-instructions)
+            (recur state'))
           (do (println "[i] No more releases!")
               (recur state)))
+
+        (= input (int \j))
+        (if (:release state)
+          (let [videos-length (dec (count (:videos (:release state))))
+                video-index   (min videos-length (inc (:video-index state)))
+                state'        (assoc state :video-index video-index)]
+            (clear)
+            (print-release state')
+            (print-instructions)
+            (recur state'))
+          (recur state))
+
+        (= input (int \k))
+        (if (:release state)
+          (let [video-index (max 0 (dec (:video-index state)))
+                state'        (assoc state :video-index video-index)]
+            (clear)
+            (print-release state')
+            (print-instructions)
+            (recur state'))
+          (recur state))
+
+        (= input (int \newline))
+        (let [release (:release state)
+              video   (nth (:videos release) (:video-index state) nil)]
+          (when video
+            (browse-url (:uri video)))
+          (recur state))
 
         :else (recur state)))))
 
 (defn main! []
   (validate-state initial-state *command-line-args*)
+  (clear)
+  (print-init initial-state)
+  (print "> Fetching initial results... ")
   (let [state (fetch-page! initial-state)]
+    (println "Done!")
     (if (some? (:results state))
-      (do (print-init state)
+      (do (print-instructions)
           (read-loop! state))
       (println "[!] No initial results!"))))
 
