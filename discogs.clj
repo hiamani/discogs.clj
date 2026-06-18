@@ -85,7 +85,7 @@
   (let [next-index (inc index)
         next-page? (>= next-index (count results))]
     (-> (if next-page?
-          (fetch-page! (assoc state :page (inc page) :index 1))
+          (fetch-page! (assoc state :page (inc page) :index 0))
           (assoc state :index next-index))
         (fetch-current-release!))))
 
