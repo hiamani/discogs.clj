@@ -346,7 +346,8 @@
           (println "Year:"    (:year resource))
           (println "Master:"  (if (:master? resource) "Yes" "No"))
           (println "Page:"    (:uri resource))
-          (println "Seen:"    (if (:cached? resource) (green "Yes") "No"))
+          (when conn
+            (println "Seen:"    (if (:cached? resource) (green "Yes") "No")))
           (if (seq (:videos resource))
             (do (println "Videos:")
                 (doseq [[index video] (map-indexed vector (:videos resource))]
