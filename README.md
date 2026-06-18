@@ -10,6 +10,7 @@ discogs.clj -- Scrape the Discogs API for release videos
   -y, --year YEAR       Year
   -p, --page PAGE    1  Starting page
   -i, --index INDEX  1  Starting index
+
 ```
 
 ### Dependencies
@@ -22,6 +23,15 @@ discogs.clj -- Scrape the Discogs API for release videos
 ```sh
 $ chmod +x discogs.clj
 $ ./discogs.clj
+```
+
+### Instructions
+
+```
+[?] Press n for next release, p for previous, q to quit.
+    To navigate videos, press j to go down, k to go up
+    Press Enter to open video link in the browser
+    Press Space to play/pause audio
 ```
 
 ### Roadmap
