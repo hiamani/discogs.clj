@@ -15,7 +15,7 @@ discogs.clj -- Scrape the Discogs API for release videos
 ### Dependencies
 
 - **babashka**: See the [babashka installation instructions](https://github.com/babashka/babashka#installation) for getting started.
-- **mpv** (optional): Install [mpv](https://mpv.io) for audio playback
+- **mpv** (optional): Install [mpv](https://mpv.io) for audio playback.
 
 ### Running
 
