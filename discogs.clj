@@ -403,17 +403,20 @@
 
 (defn header-lines [{:keys [index results resource style] :as state}]
   (let [result (nth results index)]
-    (into (index-of-lines state)
-          [(line "Artists:" (str/join ", " (map :name (:artists resource))))
-           (line "Title:  " (:title resource))
-           (line "Year:   " (:year resource))
-           (line "Master: " (if (:master? resource) "Yes" "No"))
-           (line "Page:   " (:uri resource))
-           (line "Exact   "
-                 (if (= #{(str/capitalize style)} (set (:style result)))
-                   "Yes" "No"))
-           (line "Have:   " (:have (:community result)))
-           (line "Want:   " (:want (:community result)))])))
+    (cond-> (index-of-lines state)
+      :always
+      (into [(line "Artists:" (str/join ", " (map :name (:artists resource))))
+             (line "Title:  " (:title resource))
+             (line "Year:   " (:year resource))
+             (line "Master: " (if (:master? resource) "Yes" "No"))
+             (line "Page:   " (:uri resource))
+             (line "Exact   "
+                   (if (= #{(str/capitalize style)} (set (:style result)))
+                     "Yes" "No"))
+             (line "Have:   " (:have (:community result)))
+             (line "Want:   " (:want (:community result)))])
+      $conn
+      (conj (line "Seen:   " (if (:cached? resource) (green "Yes") "No"))))))
 
 (defn resource-lines [{:keys [resource] :as state}]
   (if-not resource
