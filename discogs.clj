@@ -43,6 +43,14 @@
     (.close tty)
     ch))
 
+(defn term-rows []
+  (let [out (-> (ProcessBuilder. ["stty" "size"])
+                (.redirectInput (java.io.File. "/dev/tty"))
+                (.start))
+        s   (slurp (.getInputStream out))]
+    (.waitFor out)
+    (some-> s str/trim (str/split #"\s+") first parse-long)))
+
 ;; State -----------------------------------------------------------------------
 
 ;; CLI Options
@@ -284,15 +292,13 @@
                :response body))
       (assoc state :results nil))))
 
-(defn -fetch-resource! [result k]
-  (when-let [resp (some-> (get result k) (http/get {:throw false}))]
-    (when (= 200 (:status resp))
-      (assoc (json/parse-string (:body resp) true)
-             :master? (= k :master_url)))))
-
 (defn fetch-resource! [result]
-  (or (-fetch-resource! result :master_url)
-      (-fetch-resource! result :resource_url)))
+  (letfn [(fetch! [url master?]
+            (when-let [resp (some-> url (http/get {:throw false}))]
+              (when (= 200 (:status resp))
+                (assoc (json/parse-string (:body resp) true) :master? master?))))]
+    (or (fetch! (:master_url result) true)
+        (fetch! (:resource_url result) false))))
 
 (defn fetch-current-resource! [{:keys [index results] :as state}]
   (let [result (nth results index nil)]
@@ -349,10 +355,6 @@
 
 ; Printing
 
-(defn clear []
-  (print "\033[2J\033[H")
-  (flush))
-
 (defn print-error [s]
   (let [divider (apply str (repeat 56 \-))]
     (println divider)
@@ -363,60 +365,94 @@
   (println "discogs.clj -- Scrape the Discogs API for release videos")
   (println summary))
 
-(defn print-init [{:keys [page index genre style] :as _state}]
-  (if style
-    (println "Welcome! Querying Discogs for style"
-             (green (str/capitalize style))
-             "in genre"
-             (green (str/capitalize genre)))
-    (println "Welcome! Querying Discogs for genre"
-             (str "{" (str/capitalize genre) "}")))
-  (println (green ">") "Starting at page" (str page ", index") (inc index)))
+; Rendering
 
-(defn print-instructions [state]
-  (println)
-  (println (str (blue "[?]") " Press " (yellow "n") " for next release, " (yellow "p") " for previous, " (yellow "q") " to quit."))
-  (println (str "    To navigate videos, press " (yellow "j") " to go down, " (yellow "k") " to go up."))
-  (println (str "    Press " (yellow "Enter") " to open video link in the browser."))
-  (when (:mpv-exists? state)
-    (println (str "    Press " (yellow "Space") " to play/pause audio."))))
+(defn line [& parts]
+  (str/join " " (map str parts)))
 
-(defn print-video [{:keys [video-index playing-index]} index video]
+(defn init-lines [{:keys [page index genre style] :as _state}]
+  [(if style
+     (line "Welcome! Querying Discogs for style" (green (str/capitalize style))
+           "in genre" (green (str/capitalize genre)))
+     (line "Welcome! Querying Discogs for genre" (str "{" (str/capitalize genre) "}")))
+   (line (green ">") "Starting at page" (str page ", index") (inc index))])
+
+(defn instruction-lines [state]
+  (cond-> [""
+           (line (blue "[?]") "Press" (yellow "n") "for next release," (yellow "p") "for previous," (yellow "q") "to quit.")
+           (line "   " "To navigate videos, press" (yellow "j") "to go down," (yellow "k") "to go up.")
+           (line "   " "Press" (yellow "Enter") "to open video link in the browser.")]
+    (:mpv-exists? state)
+    (conj (str "    Press " (yellow "Space") " to play/pause audio."))))
+
+(defn video-lines [{:keys [video-index playing-index]} index video]
   (let [uri-display (str (when (= index playing-index) "▶ ") (:uri video))
         dur-display (str "[" (int (/ (:duration video) 60)) "m"
                          (format "%02d" (mod (:duration video) 60)) "s" "]")]
     (if (= index video-index)
-      (do (println " "   (green (bold (str "> " (:title video)))))
-          (println "   " (green (bold uri-display)))
-          (println "   " (green (bold dur-display))))
-      (do (println "  -" (:title video))
-          (println "   " uri-display)
-          (println "   " dur-display)))))
+      [(line " "   (green (bold (str "> " (:title video)))))
+       (line "   " (green (bold uri-display)))
+       (line "   " (green (bold dur-display)))]
+      [(line "  -" (:title video))
+       (line "   " uri-display)
+       (line "   " dur-display)])))
 
-(defn print-resource [{:keys [page index results resource] :as state}]
-  (let [result   (nth results index nil)
-        index-of (str "(" (inc index) " of " (count results) ")")]
-    (println "-----------" "Page" page index-of "-----------")
-    (if resource
-      (do (println "Artists:"  (str/join ", " (map :name (:artists resource))))
-          (println "Title:  "  (:title resource))
-          (println "Year:   "  (:year resource))
-          (println "Master: "  (if (:master? resource) "Yes" "No"))
-          (println "Page:   "    (:uri resource))
-          (when-let [{:keys [style community]} result]
-            (println "Exact   "
-                     (if (= #{(str/capitalize (:style state))} (set style))
-                       "Yes" "No"))
-            (println "Have:   " (:have community))
-            (println "Want:   " (:want community)))
-          (when $conn
-            (println "Seen:   " (if (:cached? resource) (green "Yes") "No")))
-          (if (seq (:videos resource))
-            (do (println "Videos:")
-                (doseq [[index video] (map-indexed vector (:videos resource))]
-                  (print-video state index video)))
-            (println "(No Videos)")))
-      (println "[!] No resource found!"))))
+(defn index-of-lines [{:keys [page index results] :as _state}]
+  (let [index-of (str "(" (inc index) " of " (count results) ")")]
+    [(line "-----------" "Page" page index-of "-----------")]))
+
+(defn header-lines [{:keys [index results resource style] :as state}]
+  (let [result (nth results index)]
+    (into (index-of-lines state)
+          [(line "Artists:" (str/join ", " (map :name (:artists resource))))
+           (line "Title:  " (:title resource))
+           (line "Year:   " (:year resource))
+           (line "Master: " (if (:master? resource) "Yes" "No"))
+           (line "Page:   " (:uri resource))
+           (line "Exact   "
+                 (if (= #{(str/capitalize style)} (set (:style result)))
+                   "Yes" "No"))
+           (line "Have:   " (:have (:community result)))
+           (line "Want:   " (:want (:community result)))])))
+
+(defn resource-lines [{:keys [resource] :as state}]
+  (if-not resource
+    (conj (index-of-lines state) (line (red "[!] No resource found!")))
+    (let [header (header-lines state)
+          videos (vec (:videos resource))]
+      (if-not (seq videos)
+        (conj header (red "(No Videos)"))
+        (let [reserved (+ (count header) (count (instruction-lines state)) 1)
+              visible  (max 1 (quot (- (term-rows) reserved) 3))
+              total    (count videos)
+              v-index  (:video-index state)
+              half     (quot visible 2)
+              start    (-> (- v-index half)
+                           (max 0)
+                           (min (max 0 (- total visible))))
+              end      (min total (+ start visible))]
+          (-> header
+              (conj (line "Videos:"
+                          (when (> total visible)
+                            (str "(" (inc start) "-" end " of " total ")"))))
+              (into (mapcat #(video-lines state % (nth videos %))
+                            (range start end)))))))))
+
+(defn render-init! [state status ready?]
+  (let [lines (cond-> (init-lines state)
+                (not (:mpv-exists? state))
+                (conj (red "> mpv not found - audio playback disabled"))
+                status (conj status)
+                ready? (into (instruction-lines state)))
+        frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
+    (print frame)
+    (flush)))
+
+(defn render! [state]
+  (let [lines (into (resource-lines state) (instruction-lines state))
+        frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
+    (print frame)
+    (flush)))
 
 ;; Main ------------------------------------------------------------------------
 
@@ -445,18 +481,16 @@
         (or (= input (int \n))
             (= input (int \p)))
         (if (some? (:results state))
-          (let [state' (cond (not (:started? state)) (fetch-current-resource! state)
-                             (= input (int \n))      (forward! state)
-                             :else                   (back! state))
-                state' (assoc state' :started? true :playing-index nil)
+          (let [state'   (cond (not (:started? state)) (fetch-current-resource! state)
+                               (= input (int \n))      (forward! state)
+                               :else                   (back! state))
+                state'   (assoc state' :started? true :playing-index nil)
                 progress (select-keys state' [:genre :style :year :page :index])]
             (some-> $conn (transact-progress! progress))
             (when-let [p @player*]
               (.destroy p)
               (reset! player* nil))
-            (clear)
-            (print-resource state')
-            (print-instructions state')
+            (render! state')
             (recur state'))
           (do (println "[i] No more resources!")
               (recur state)))
@@ -466,9 +500,7 @@
           (let [videos-length (dec (count (:videos (:resource state))))
                 video-index   (min videos-length (inc (:video-index state)))
                 state'        (assoc state :video-index video-index)]
-            (clear)
-            (print-resource state')
-            (print-instructions state')
+            (render! state')
             (recur state'))
           (recur state))
 
@@ -476,9 +508,7 @@
         (if (:resource state)
           (let [video-index (max 0 (dec (:video-index state)))
                 state'        (assoc state :video-index video-index)]
-            (clear)
-            (print-resource state')
-            (print-instructions state')
+            (render! state')
             (recur state'))
           (recur state))
 
@@ -499,18 +529,15 @@
             (do (when-let [player @player*]
                   (.destroy player)
                   (reset! player* nil))
-                (clear)
                 (if (= (:video-index state) (:playing-index state))
                   (let [state' (assoc state :playing-index nil)]
-                    (print-resource state')
-                    (print-instructions state')
+                    (render! state')
                     (recur state'))
                   (let [args   ["mpv" "--no-video" "--really-quiet" (:uri video)]
                         player (-> (ProcessBuilder. args) (.start))
                         state' (assoc state :playing-index (:video-index state))]
                     (reset! player* player)
-                    (print-resource state')
-                    (print-instructions state')
+                    (render! state')
                     (recur state'))))
 
             :else (recur state)))
@@ -527,18 +554,12 @@
 (defn main! []
   (check-args! (:opts initial-state))
   (let [state (resolve-state)]
-    (clear)
-    (print-init state)
-    (when-not (:mpv-exists? state)
-      (println (red "> mpv not found - audio playback disabled")))
-    (print (green ">") "Fetching initial results... ")
+    (render-init! state (str (green ">") " Fetching initial results...") false)
     (let [state' (fetch-page! state)]
-      (println "Done!")
-      ;; (println (green ">") "Press" (yellow "n") "to fetch the first result")
       (if (some? (:results state'))
-        (do (print-instructions state')
+        (do (render-init! state' (str (green ">") " Fetching initial results... Done!") true)
             (read-loop! state'))
-        (println (red "[!]") "No initial results!")))))
+        (render-init! state' (red "[!] No initial results!") false)))))
 
 ;; Init
 
