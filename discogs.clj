@@ -21,21 +21,22 @@
 
 (def player* (atom nil))
 
-;; Interact with tty
+;; tty helpers
 
-(defn stty [& args]
-  (-> (ProcessBuilder. (into ["stty"] args))
-      (.redirectInput (java.io.File. "/dev/tty"))
-      (.start)
-      (.waitFor)))
+(defn stty [args {:keys [read?]}]
+  (let [proc (-> (ProcessBuilder. (into ["stty"] args))
+                 (.redirectInput (java.io.File. "/dev/tty"))
+                 (.start))
+        out  (when read? (slurp (.getInputStream proc)))]
+    (.waitFor proc)
+    out))
 
-(stty "-icanon" "-echo")
-
-(.addShutdownHook
- (Runtime/getRuntime)
- (Thread. (fn []
-            (some-> @player* (.destroy))
-            (stty "icanon" "echo"))))
+(defn term-rows []
+  (some-> (stty ["size"] {:read? true})
+          (str/trim)
+          (str/split #"\s+")
+          (first)
+          (parse-long)))
 
 (defn read-char []
   (let [tty (java.io.FileInputStream. "/dev/tty")
@@ -43,13 +44,15 @@
     (.close tty)
     ch))
 
-(defn term-rows []
-  (let [out (-> (ProcessBuilder. ["stty" "size"])
-                (.redirectInput (java.io.File. "/dev/tty"))
-                (.start))
-        s   (slurp (.getInputStream out))]
-    (.waitFor out)
-    (some-> s str/trim (str/split #"\s+") first parse-long)))
+;; Configure tty
+
+(stty ["-icanon" "-echo"] {:read? false})
+
+(.addShutdownHook
+ (Runtime/getRuntime)
+ (Thread. (fn []
+            (some-> @player* (.destroy))
+            (stty ["icanon" "echo"] {:read? false}))))
 
 ;; State -----------------------------------------------------------------------
 
@@ -327,14 +330,12 @@
           (fetch-current-resource!))
 
       (> page 1)
-      (let [prev-state (-> state
-                           (assoc :page (dec page))
-                           (fetch-page!))]
+      (let [prev-state (-> state (assoc :page (dec page)) (fetch-page!))]
         (if (some? (:results prev-state))
           (-> prev-state
               (assoc :index (dec (count (:results prev-state))))
               (fetch-current-resource!))
-          (fetch-current-resource! state)))
+          state))
 
       :else
       (fetch-current-resource! state))))
@@ -457,6 +458,70 @@
     (print frame)
     (flush)))
 
+;; Handlers --------------------------------------------------------------------
+
+(defn handle-n-p [state input]
+  (if (some? (:results state))
+    (let [state'   (cond (not (:started? state)) (fetch-current-resource! state)
+                         (= input (int \n))      (forward! state)
+                         :else                   (back! state))
+          state'   (assoc state' :started? true :playing-index nil)
+          progress (select-keys state' [:genre :style :year :page :index])]
+      (some-> $conn (transact-progress! progress))
+      (when-let [p @player*]
+        (.destroy p)
+        (reset! player* nil))
+      (render! state')
+      state')
+    (do (println "[i] No more resources!")
+        state)))
+
+(defn handle-j [state _input]
+  (if (:resource state)
+    (let [videos-length (dec (count (:videos (:resource state))))
+          video-index   (min videos-length (inc (:video-index state)))
+          state'        (assoc state :video-index video-index)]
+      (render! state')
+      state')
+    state))
+
+(defn handle-k [state _input]
+  (if (:resource state)
+    (let [video-index (max 0 (dec (:video-index state)))
+          state'      (assoc state :video-index video-index)]
+      (render! state')
+      state')
+    state))
+
+(defn handle-enter [state _input]
+  (let [resource (:resource state)
+        video    (nth (:videos resource) (:video-index state) nil)]
+    (when video
+      (browse-url (:uri video)))
+    state))
+
+(defn handle-space [state _input]
+  (let [video (nth (:videos (:resource state)) (:video-index state) nil)]
+    (cond
+      (not (:mpv-exists? state)) state
+
+      video
+      (do (when-let [player @player*]
+            (.destroy player)
+            (reset! player* nil))
+          (if (= (:video-index state) (:playing-index state))
+            (let [state' (assoc state :playing-index nil)]
+              (render! state')
+              state')
+            (let [args   ["mpv" "--no-video" "--really-quiet" (:uri video)]
+                  player (-> (ProcessBuilder. args) (.start))
+                  state' (assoc state :playing-index (:video-index state))]
+              (reset! player* player)
+              (render! state')
+              state')))
+
+      :else state)))
+
 ;; Main ------------------------------------------------------------------------
 
 (defn check-args! [{:keys [options summary]}]
@@ -481,69 +546,20 @@
       (cond
         (= input (int \q)) nil
 
-        (or (= input (int \n))
-            (= input (int \p)))
-        (if (some? (:results state))
-          (let [state'   (cond (not (:started? state)) (fetch-current-resource! state)
-                               (= input (int \n))      (forward! state)
-                               :else                   (back! state))
-                state'   (assoc state' :started? true :playing-index nil)
-                progress (select-keys state' [:genre :style :year :page :index])]
-            (some-> $conn (transact-progress! progress))
-            (when-let [p @player*]
-              (.destroy p)
-              (reset! player* nil))
-            (render! state')
-            (recur state'))
-          (do (println "[i] No more resources!")
-              (recur state)))
+        (or (= input (int \n)) (= input (int \p)))
+        (recur (handle-n-p state input))
 
         (= input (int \j))
-        (if (:resource state)
-          (let [videos-length (dec (count (:videos (:resource state))))
-                video-index   (min videos-length (inc (:video-index state)))
-                state'        (assoc state :video-index video-index)]
-            (render! state')
-            (recur state'))
-          (recur state))
+        (recur (handle-j state input))
 
         (= input (int \k))
-        (if (:resource state)
-          (let [video-index (max 0 (dec (:video-index state)))
-                state'        (assoc state :video-index video-index)]
-            (render! state')
-            (recur state'))
-          (recur state))
+        (recur (handle-k state input))
 
         (= input (int \newline))
-        (let [resource (:resource state)
-              video    (nth (:videos resource) (:video-index state) nil)]
-          (when video
-            (browse-url (:uri video)))
-          (recur state))
+        (recur (handle-enter state input))
 
         (= input (int \space))
-        (let [video (nth (:videos (:resource state)) (:video-index state) nil)]
-          (cond
-            (not (:mpv-exists? state))
-            (recur state)
-
-            video
-            (do (when-let [player @player*]
-                  (.destroy player)
-                  (reset! player* nil))
-                (if (= (:video-index state) (:playing-index state))
-                  (let [state' (assoc state :playing-index nil)]
-                    (render! state')
-                    (recur state'))
-                  (let [args   ["mpv" "--no-video" "--really-quiet" (:uri video)]
-                        player (-> (ProcessBuilder. args) (.start))
-                        state' (assoc state :playing-index (:video-index state))]
-                    (reset! player* player)
-                    (render! state')
-                    (recur state'))))
-
-            :else (recur state)))
+        (recur (handle-space state input))
 
         :else (recur state)))))
 
