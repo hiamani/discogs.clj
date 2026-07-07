@@ -63,8 +63,8 @@
    ["-g" "--genre GENRE"   "Genre (required)"]
    ["-s" "--style STYLE"   "Style"]
    ["-y" "--year YEAR"     "Year"]
-   ["-p" "--page PAGE"     "Starting page"  :parse-fn parse-long :default 1]
-   ["-i" "--index INDEX"   "Starting index" :parse-fn parse-long :default 1]
+   ["-p" "--page PAGE"     "Starting page"  :parse-fn parse-long]
+   ["-i" "--index INDEX"   "Starting index" :parse-fn parse-long]
    ["-d" "--database PATH" "Database path"]
    ["-r" "--resume"        "Resume session"]])
 
@@ -77,8 +77,8 @@
      :genre         genre
      :style         style
      :year          year
-     :page          (if (< 0 page) page 1)
-     :index         (if (< 0 index) (dec index) 0)
+     :page          (if (and page (< 0 page)) page 1)
+     :index         (if (and index (< 0 index)) (dec index) 0)
      :results       nil
      :resource      nil
      :video-index   0
@@ -255,7 +255,7 @@
           (entity->resource)
           (assoc :cached? true)))
 
-(defn ?progress [conn progress]
+(defn ?progress-by-key [conn progress]
   (some-> (d/q '[:find (pull ?e [*])
                  :in $ ?key
                  :where [?e :progress/key ?key]]
@@ -442,12 +442,17 @@
               (into (mapcat #(video-lines state % (nth videos %))
                             (range start end)))))))))
 
-(defn render-init! [state status ready?]
+(def init-statuses
+  {:fetching (str (green ">") " Fetching initial results...")
+   :done     (str (green ">") " Fetching initial results... Done!")
+   :error    (red "[!] No initial results!")})
+
+(defn render-init! [state {:keys [status]}]
   (let [lines (cond-> (init-lines state)
                 (not (:mpv-exists? state))
                 (conj (red "> mpv not found - audio playback disabled"))
-                status (conj status)
-                ready? (into (instruction-lines state)))
+                (some? status)   (conj (get init-statuses status))
+                (= :done status) (into (instruction-lines state)))
         frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
     (print frame)
     (flush)))
@@ -525,7 +530,7 @@
 ;; Main ------------------------------------------------------------------------
 
 (defn check-args! [{:keys [options summary]}]
-  (cond (or (every? (comp nil? val) (dissoc options :page :index))
+  (cond (or (every? (comp nil? val) options)
             (:help options))
         (do (print-summary summary)
             (System/exit 0))
@@ -565,7 +570,7 @@
 
 (defn resolve-state []
   (let [progress (when (:resume initial-state)
-                   (some-> $conn (?progress initial-state)))]
+                   (some-> $conn (?progress-by-key initial-state)))]
     (cond-> initial-state
       (some? progress)
       (merge (select-keys (entity->map progress) [:page :index])))))
@@ -573,12 +578,13 @@
 (defn main! []
   (check-args! (:opts initial-state))
   (let [state (resolve-state)]
-    (render-init! state (str (green ">") " Fetching initial results...") false)
+    (render-init! state {:status :fetching})
     (let [state' (fetch-page! state)]
       (if (some? (:results state'))
-        (do (render-init! state' (str (green ">") " Fetching initial results... Done!") true)
+        (do (render-init! state' {:status :done})
             (read-loop! state'))
-        (render-init! state' (red "[!] No initial results!") false)))))
+        (do (render-init! state' {:status :error})
+            (println))))))
 
 ;; Init
 
