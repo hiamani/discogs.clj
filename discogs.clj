@@ -83,6 +83,7 @@
      :resource      nil
      :video-index   0
      :playing-index nil
+     :started?      false
      :mpv-exists?   (mpv-exists?)
      :database      database
      :resume        resume}))
