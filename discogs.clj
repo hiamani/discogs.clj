@@ -334,12 +334,14 @@
 (defn forward! [{:keys [index data] :as state}]
   (let [next-index (inc (:result index))
         next-page? (>= next-index (count (:results data)))]
-    (-> (if next-page?
-          (fetch-page! (-> state
-                           (update-in [:index :page] inc)
-                           (assoc-in [:index :result] 0)))
-          (assoc-in state [:index :result] next-index))
-        (fetch-current-resource!))))
+    (if next-page?
+      (let [state' (-> state (update-in [:index :page] inc)
+                       (assoc-in [:index :result] 0)
+                       (fetch-page!))]
+        (if (seq (:results (:data state')))
+          (fetch-current-resource! state')
+          state))
+      (fetch-current-resource! (assoc-in state [:index :result] next-index)))))
 
 (defn back! [{:keys [index] :as state}]
   (let [prev-index (dec (:result index))]
