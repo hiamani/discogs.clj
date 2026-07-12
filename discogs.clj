@@ -386,7 +386,8 @@
   (let [next-index (inc (:result index))
         next-page? (>= next-index (count (:results data)))]
     (if next-page?
-      (let [state' (-> state (update-in [:index :page] inc)
+      (let [state' (-> state
+                       (update-in [:index :page] inc)
                        (assoc-in [:index :result] 0)
                        (fetch-page!))]
         (if (seq (:results (:data state')))
@@ -405,15 +406,16 @@
           (fetch-current-resource!))
 
       (> (:page index) 1)
-      (let [prev-state (-> state (update-in [:index :page] dec) (fetch-page!))]
-        (if (seq (:results (:data prev-state)))
-          (-> prev-state
-              (assoc-in [:index :result] (dec (count (:results (:data prev-state)))))
+      (let [state' (-> state
+                       (update-in [:index :page] dec)
+                       (fetch-page!))]
+        (if-let [results (not-empty (:results (:data state')))]
+          (-> state'
+              (assoc-in [:index :result] (dec (count results)))
               (fetch-current-resource!))
           state))
 
-      :else
-      (fetch-current-resource! state))))
+      :else state)))
 
 (defn run-effect! [state [effect callback]]
   (cond-> (case effect
