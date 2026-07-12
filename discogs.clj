@@ -490,18 +490,18 @@
         end    (min total (+ start capacity))]
     [start end]))
 
-(defn videos-lines [{:keys [data index] :as state} capacity]
-  (let [videos      (:videos (:resource data))
-        total       (count videos)
-        [start end] (video-range total capacity (:video index))]
-    (into [(line "Videos:" (when (> total capacity)
-                             (str " (" (inc start) "-" end " of " total ")")))]
-          (mapcat #(video-lines state % (nth videos %))
-                  (range start end)))))
-
 (defn video-capacity [header]
   (let [reserved (+ (count header) (count instruction-lines) 1)]
     (max 1 (quot (- (term-rows) reserved) 3))))
+
+(defn videos-lines [{:keys [data index] :as state} header]
+  (let [videos      (:videos (:resource data))
+        total       (count videos)
+        capacity    (video-capacity header)
+        [start end] (video-range total capacity (:video index))]
+    (into [(line "Videos:" (str " (" (inc (:video index)) " of " total ")"))]
+          (mapcat #(video-lines state % (nth videos %))
+                  (range start end)))))
 
 (defn resource-lines [{:keys [data] :as state}]
   (let [resource (:resource data)
@@ -515,7 +515,7 @@
       (conj header (red "(No Videos)"))
 
       :else
-      (into header (videos-lines state (video-capacity header))))))
+      (into header (videos-lines state header)))))
 
 (def init-statuses
   {:fetching (str (green ">") " Fetching initial results...")
