@@ -85,7 +85,8 @@
                :resource nil}
      :view    {:key   :init
                :props {:status :fetching}}
-     :effects {:browse-uri nil}}))
+     :effects {:browse-uri nil
+               :browse-id 0}}))
 
 (def state* (atom initial-state))
 
@@ -355,7 +356,7 @@
 
       (> (:page index) 1)
       (let [prev-state (-> state (update-in [:index :page] dec) (fetch-page!))]
-        (if (some? (:results (:data prev-state)))
+        (if (seq (:results (:data prev-state)))
           (-> prev-state
               (assoc-in [:index :result] (dec (count (:results (:data prev-state)))))
               (fetch-current-resource!))
@@ -477,7 +478,7 @@
 (def init-statuses
   {:fetching (str (green ">") " Fetching initial results...")
    :done     (str (green ">") " Fetching initial results... Done!")
-   :error    (red "[!] No initial results!")})
+   :error    (str (red "[!]") " No initial results!")})
 
 (defn init-lines [state]
   (let [status (-> state :view :props :status)]
@@ -491,11 +492,11 @@
 
 (defn handle-n-p [{:keys [view data] :as state} input]
   (if (some? (:results data))
-    (let [init? (= :init (:key view))
-          next? (= input (int \n))
-          state'    (cond init? (fetch-current-resource! state)
-                          next? (forward! state)
-                          :else (back! state))]
+    (let [init?  (= :init (:key view))
+          next?  (= input (int \n))
+          state' (cond init? (fetch-current-resource! state)
+                       next? (forward! state)
+                       :else (back! state))]
       (-> state'
           (assoc-in [:index :playing] nil)
           (assoc :view {:key :resources})))
@@ -515,10 +516,10 @@
     state))
 
 (defn handle-enter [{:keys [data index] :as state} _input]
-  (let [video (nth (:videos (:resource data)) (:video index) nil)]
-    (when video
-      (browse-url (:uri video)))
-    state))
+  (let [uri (some-> data :resource :videos (nth (:video index) nil) :uri)]
+    (-> state
+        (assoc-in [:effects :browse-uri] uri)
+        (update-in [:effects :browse-id] inc))))
 
 (defn handle-space [{:keys [data index] :as state} _input]
   (let [video (nth (:videos (:resource data)) (:video index) nil)
@@ -541,6 +542,15 @@
       :else state)))
 
 ;; Watchers --------------------------------------------------------------------
+
+;; Browser
+
+(defn browse! [_ _ prev next]
+  (let [id1 (get-in prev [:effects :browse-id])
+        id2 (get-in next [:effects :browse-id])
+        uri (get-in next [:effects :browse-uri])]
+    (when (and (not= id1 id2) uri)
+      (browse-url uri))))
 
 ;; Player
 
@@ -635,16 +645,17 @@
 ;; Main
 
 (defn mount! []
+  (add-watch state* ::browse browse!)
+  (add-watch state* ::play   play!)
+  (add-watch state* ::save   save-progress!)
   (add-watch state* ::render render!)
-  (add-watch state* ::play play!)
-  (add-watch state* ::save-progress save-progress!)
   (reset! state* (resolve-state!)))
 
 (defn main! []
   (check-args! cli-opts)
   (mount!)
   (let [state (fetch-page! @state*)
-        ok?   (some? (:results (:data state)))
+        ok?   (seq (:results (:data state)))
         view  {:key :init :props {:status (if ok? :done :error)}}]
     (reset! state* (assoc state :view view))
     (when ok?
