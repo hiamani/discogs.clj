@@ -76,19 +76,19 @@
 (def initial-state
   (let [{:keys [genre style year page index]} (:options cli-opts)]
     {:id      -1
-     :params  {:genre genre
-               :style style
-               :year  year}
-     :index   {:result  index
-               :page    page
-               :video   0
-               :playing nil}
-     :data    {:results  nil
-               :resource nil}
-     :view    {:key   :init
-               :props {:status :fetching}}
-     :effects {:browse-uri nil
-               :browse-id 0}}))
+     :params   {:genre genre
+                :style style
+                :year  year}
+     :index    {:result  index
+                :page    page
+                :video   0}
+     :data     {:results  nil
+                :resource nil}
+     :view     {:key   :init
+                :props {:status :fetching}}
+     :actions {:play-video nil
+               :browse-uri nil
+               :browse-id  0}}))
 
 (def state* (atom initial-state))
 
@@ -372,7 +372,9 @@
         (if (seq (:results (:data state')))
           (fetch-current-resource! state')
           state))
-      (fetch-current-resource! (assoc-in state [:index :result] next-index)))))
+      (-> state
+          (assoc-in [:index :result] next-index)
+          (fetch-current-resource!)))))
 
 (defn back! [{:keys [index] :as state}]
   (let [prev-index (dec (:result index))]
@@ -392,6 +394,63 @@
 
       :else
       (fetch-current-resource! state))))
+
+;; Handlers --------------------------------------------------------------------
+
+(defn fetch-callback [state]
+  (-> state
+      (assoc-in [:actions :play-video] nil)
+      (assoc :view {:key :resources})))
+
+(defn handle-n-p [{:keys [view data] :as state} input]
+  (if (some? (:results data))
+    (let [init?  (= :init (:key view))
+          next?  (= input (int \n))]
+      [state (cond init? [:refetch fetch-callback]
+                   next? [:forward fetch-callback]
+                   :else [:back fetch-callback])])
+    [state nil]))
+
+(defn handle-j [{:keys [data index] :as state} _input]
+  (if (:resource data)
+    (let [videos-length (dec (count (:videos (:resource data))))
+          video-index   (min videos-length (inc (:video index)))]
+      [(assoc-in state [:index :video] video-index) nil])
+    [state nil]))
+
+(defn handle-k [{:keys [data index] :as state} _input]
+  (if (:resource data)
+    (let [video-index (max 0 (dec (:video index)))]
+      [(assoc-in state [:index :video] video-index) nil])
+    [state nil]))
+
+(defn handle-enter [state _input]
+  (let [uri (some-> (current-video state) :uri)]
+    [(-> state
+         (assoc-in [:actions :browse-uri] uri)
+         (update-in [:actions :browse-id] inc))
+     nil]))
+
+(defn handle-space [{:keys [index actions] :as state} _input]
+  (let [video  (current-video state)
+        no-mpv (not mpv-exists?)]
+    (cond
+      no-mpv [state nil]
+      video  [(if (= (:video index) (:play-video actions))
+                (assoc-in state [:actions :play-video] nil)
+                (assoc-in state [:actions :play-video] (:video index)))
+              nil]
+      :else  [state nil])))
+
+(defn handle-input [state input]
+  (let [n-or-p-input (or (= input (int \n)) (= input (int \p)))]
+    (cond
+      n-or-p-input             (handle-n-p state input)
+      (= input (int \j))       (handle-j state input)
+      (= input (int \k))       (handle-k state input)
+      (= input (int \newline)) (handle-enter state input)
+      (= input (int \space))   (handle-space state input)
+      :else                    [state nil])))
 
 ;; Display ---------------------------------------------------------------------
 
@@ -470,8 +529,8 @@
       $conn
       (conj (line "Seen:   " (if (:cached? resource) (green "Yes") "No"))))))
 
-(defn video-lines [{:keys [index] :as _state} idx video]
-  (let [uri-display (str (when (= idx (:playing index)) "▶ ") (:uri video))
+(defn video-lines [{:keys [index actions] :as _state} idx video]
+  (let [uri-display (str (when (= idx (:play-video actions)) "▶ ") (:uri video))
         dur-display (str "[" (int (/ (:duration video) 60)) "m"
                          (format "%02d" (mod (:duration video) 60)) "s" "]")]
     (if (= idx (:video index))
@@ -530,67 +589,14 @@
       (some? status)   (conj (get init-statuses status))
       (= :done status) (into instruction-lines))))
 
-;; Handlers --------------------------------------------------------------------
-
-(defn handle-n-p [{:keys [view data] :as state} input]
-  (if (some? (:results data))
-    (let [init?  (= :init (:key view))
-          next?  (= input (int \n))
-          state' (cond init? (fetch-current-resource! state)
-                       next? (forward! state)
-                       :else (back! state))]
-      (-> state'
-          (assoc-in [:index :playing] nil)
-          (assoc :view {:key :resources})))
-    state))
-
-(defn handle-j [{:keys [data index] :as state} _input]
-  (if (:resource data)
-    (let [videos-length (dec (count (:videos (:resource data))))
-          video-index   (min videos-length (inc (:video index)))]
-      (assoc-in state [:index :video] video-index))
-    state))
-
-(defn handle-k [{:keys [data index] :as state} _input]
-  (if (:resource data)
-    (let [video-index (max 0 (dec (:video index)))]
-      (assoc-in state [:index :video] video-index))
-    state))
-
-(defn handle-enter [state _input]
-  (let [uri (some-> (current-video state) :uri)]
-    (-> state
-        (assoc-in [:effects :browse-uri] uri)
-        (update-in [:effects :browse-id] inc))))
-
-(defn handle-space [{:keys [index] :as state} _input]
-  (let [video  (current-video state)
-        no-mpv (not mpv-exists?)]
-    (cond
-      no-mpv state
-      video  (if (= (:video index) (:playing index))
-               (assoc-in state [:index :playing] nil)
-               (assoc-in state [:index :playing] (:video index)))
-      :else  state)))
-
-(defn handle-input [state input]
-  (let [n-or-p-input (or (= input (int \n)) (= input (int \p)))]
-    (cond
-      n-or-p-input             (handle-n-p state input)
-      (= input (int \j))       (handle-j state input)
-      (= input (int \k))       (handle-k state input)
-      (= input (int \newline)) (handle-enter state input)
-      (= input (int \space))   (handle-space state input)
-      :else state)))
-
 ;; Watchers --------------------------------------------------------------------
 
 ;; Browser
 
 (defn browse! [_ _ prev next]
-  (let [id1 (get-in prev [:effects :browse-id])
-        id2 (get-in next [:effects :browse-id])
-        uri (get-in next [:effects :browse-uri])]
+  (let [id1 (get-in prev [:actions :browse-id])
+        id2 (get-in next [:actions :browse-id])
+        uri (get-in next [:actions :browse-uri])]
     (when (and (not= id1 id2) uri)
       (browse-url uri))))
 
@@ -608,10 +614,11 @@
         player (-> (ProcessBuilder. args) (.start))]
     (reset! player* player)))
 
-(defn play! [_ _ prev {:keys [index] :as next}]
-  (when (not= (:playing (:index prev)) (:playing index))
+(defn play! [_ _ prev next]
+  (when (not= (:play-video (:actions prev))
+              (:play-video (:actions next)))
     (destroy-player!)
-    (when-let [idx (:playing index)]
+    (when-let [idx (:play-video (:actions next))]
       (some-> (video-by-index next idx) :uri (play-video!)))))
 
 ;; Progress transactor
@@ -648,6 +655,24 @@
             (print-summary summary)
             (System/exit 1))))
 
+(defn run-effect! [state [effect callback]]
+  (cond-> (case effect
+            :refetch (fetch-current-resource! state)
+            :forward (forward! state)
+            :back    (back! state))
+    callback (callback)))
+
+(defn read-loop! []
+  (loop []
+    (let [input (read-char)]
+      (when-not (= input (int \q))
+        (let [state       @state*
+              [state' fx] (handle-input state input)
+              state''     (if fx (run-effect! state' fx) state')]
+          (when-not (identical? state state'')
+            (reset! state* state''))
+          (recur))))))
+
 (defn resolve-state! []
   (let [progress (when (:resume (:options cli-opts))
                    (some-> $conn
@@ -658,16 +683,6 @@
           (assoc-in [:index :page]   (:page progress))
           (assoc-in [:index :result] (:index progress)))
       initial-state)))
-
-(defn read-loop! []
-  (loop []
-    (let [input (read-char)]
-      (when-not (= input (int \q))
-        (let [state  @state*
-              state' (handle-input state input)]
-          (when-not (identical? state state')
-            (reset! state* state'))
-          (recur))))))
 
 ;; Process ---------------------------------------------------------------------
 
