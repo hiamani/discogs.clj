@@ -498,10 +498,8 @@
                           :else (back! state))]
       (-> state'
           (assoc-in [:index :playing] nil)
-          (assoc :view {:key :resources})
-          (update :id inc)))
-    (do (println "[i] No more resources!")
-        state)))
+          (assoc :view {:key :resources})))
+    state))
 
 (defn handle-j [{:keys [data index] :as state} _input]
   (if (:resource data)
