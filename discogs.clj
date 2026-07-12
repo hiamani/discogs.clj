@@ -78,10 +78,10 @@
     {:params {:genre genre
               :style style
               :year  year}
-     :index  {:result index
-              :page   page
-              :video  0
-              :player nil}
+     :index  {:result  index
+              :page    page
+              :video   0
+              :playing nil}
      :data   {:results  nil
               :resource nil}
      :view   {:key   :init
