@@ -213,8 +213,13 @@
 
 ;; Transformers
 
+(defn strip-nils [m]
+  (into {} (remove (comp nil? val)) m))
+
 (defn map->entity [m ns']
-  (update-keys m #(keyword (name ns') (name %))))
+  (-> m
+      (strip-nils)
+      (update-keys #(keyword (name ns') (name %)))))
 
 (defn entity->map [ent]
   (update-keys (dissoc ent :db/id) (comp keyword name)))
@@ -303,8 +308,7 @@
   (d/transact! conn [(resource->entity resource)]))
 
 (defn transact-progress! [conn progress]
-  (let [ent (progress->entity progress)]
-    (d/transact! conn [(into {} (remove (comp nil? val)) ent)])))
+  (d/transact! conn [(progress->entity progress)]))
 
 ;; Effects ---------------------------------------------------------------------
 
