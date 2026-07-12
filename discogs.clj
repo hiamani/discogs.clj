@@ -66,7 +66,7 @@
    ["-i" "--index INDEX"   "Starting index" :parse-fn parse-index :default 0]
    ["-d" "--database PATH" "Database path"]
    ["-x" "--no-database"   "Skip database connection"]
-   ["-r" "--resume"        "Resume session"]])
+   ["-r" "--resume"        "Resume last session"]])
 
 (def cli-opts
   (parse-opts *command-line-args* cli-config))
@@ -79,9 +79,9 @@
      :params   {:genre genre
                 :style style
                 :year  year}
-     :index    {:result  index
-                :page    page
-                :video   0}
+     :index    {:result index
+                :page   page
+                :video  0}
      :data     {:results  nil
                 :resource nil}
      :view     {:key   :init
@@ -186,12 +186,16 @@
    :progress/index  #:db{:valueType   :db.type/long
                          :cardinality :db.cardinality/one}})
 
+(def meta-schema
+  {:meta/created-at #:db{:valueType :db.type/instant}})
+
 (def schema
   (merge result-schema
          resource-schema
          artist-schema
          video-schema
-         progress-schema))
+         progress-schema
+         meta-schema))
 
 ;; Connection
 
@@ -199,8 +203,8 @@
   (let [home     (System/getProperty "user.home")
         xdg-data (System/getenv "XDG_DATA_HOME")]
     (if (not-empty xdg-data)
-      (str (fs/path xdg-data "discogs" "db"))
-      (str (fs/path home ".local" "share" "discogs" "db")))))
+      (str (fs/path xdg-data "discogs-clj" "db"))
+      (str (fs/path home ".local" "share" "discogs-clj" "db")))))
 
 (def db-path
   (or (:database (:options cli-opts))
@@ -262,7 +266,8 @@
   (-> progress
       (select-keys [:genre :style :year :page :index])
       (assoc :key (progress-key progress))
-      (map->entity :progress)))
+      (map->entity :progress)
+      (assoc :meta/created-at (java.util.Date.))))
 
 (defn entity->resource [entity]
   (-> entity
@@ -272,32 +277,46 @@
 
 ;; Queries
 
-(defn ?resource-by-url [conn resource_url]
+(defn ?resource-by-url [db resource_url]
   (some-> (d/q '[:find (pull ?e [* {:resource/artists [*]
                                     :resource/videos [*]}])
                  :in $ ?resource_url
                  :where [?e :resource/id ?id]
                  [?e :resource/resource_url ?resource_url]]
-               (d/db conn)
+               db
                resource_url)
           (ffirst)
           (entity->resource)
           (assoc :cached? true)))
 
-(defn ?progress-by-key [conn progress]
+(defn ?progress-by-key [db progress]
   (some-> (d/q '[:find (pull ?e [*])
                  :in $ ?key
                  :where [?e :progress/key ?key]]
-               (d/db conn)
+               db
                (progress-key progress))
           (ffirst)))
 
-(defn ?progress-list [conn]
+(defn ?progress-list [db]
   (some->> (d/q '[:find (pull ?e [*])
                   :in $
                   :where [?e :progress/key]]
-                (d/db conn))
+                db)
            (map first)))
+
+(defn ?last-progress-inst [db]
+  (d/q '[:find (max ?t) .
+         :where [?e :progress/key]
+         [?e :meta/created-at ?t]]
+       db))
+
+(defn ?last-progress [db]
+  (let [t (?last-progress-inst db)]
+    (d/q '[:find (pull ?e [*]) .
+           :in $ ?t
+           :where [?e :meta/created-at ?t]
+           [?e :progress/key]]
+         db t)))
 
 ;; Transactions
 
@@ -349,8 +368,9 @@
 (defn fetch-current-resource! [state]
   (let [result (current-result state)]
     (if-let [cached (and $conn result
-                         (or (?resource-by-url $conn (:master_url result))
-                             (?resource-by-url $conn (:resource_url result))))]
+                         (let [db (d/db $conn)]
+                           (or (?resource-by-url db (:master_url result))
+                               (?resource-by-url db (:resource_url result)))))]
       (-> state
           (assoc-in [:data :resource] cached)
           (assoc-in [:index :video] 0)
@@ -395,6 +415,13 @@
       :else
       (fetch-current-resource! state))))
 
+(defn run-effect! [state [effect callback]]
+  (cond-> (case effect
+            :refetch (fetch-current-resource! state)
+            :forward (forward! state)
+            :back    (back! state))
+    callback (callback)))
+
 ;; Handlers --------------------------------------------------------------------
 
 (defn fetch-callback [state]
@@ -408,7 +435,7 @@
           next?  (= input (int \n))]
       [state (cond init? [:refetch fetch-callback]
                    next? [:forward fetch-callback]
-                   :else [:back fetch-callback])])
+                   :else [:back    fetch-callback])])
     [state nil]))
 
 (defn handle-j [{:keys [data index] :as state} _input]
@@ -469,10 +496,7 @@
 ;; Printing
 
 (defn print-error [s]
-  (let [divider (apply str (repeat 56 \-))]
-    (println divider)
-    (println "" (red "[!]") "Error:" s)
-    (println divider)))
+  (println "" (red "[!]") "Error:" s))
 
 (defn print-summary [summary]
   (println "discogs.clj -- Scrape the Discogs API for release videos")
@@ -637,30 +661,47 @@
     (print frame)
     (flush)))
 
+;; Setup
+
+(defn watch! []
+  (add-watch state* ::browse browse!)
+  (add-watch state* ::play   play!)
+  (add-watch state* ::save   save-progress!)
+  (add-watch state* ::render render!))
+
 ;; Initialization --------------------------------------------------------------
 
-(defn check-args! [{:keys [options summary]}]
-  (cond (or (empty? *command-line-args*)
-            (:help options))
-        (do (print-summary summary)
-            (System/exit 0))
+(defn resolve-state! [{:keys [options]}]
+  (let [progress (when (:resume options)
+                   (some-> $conn d/db (?last-progress) (entity->map)))]
+    (cond
+      (some? progress)
+      (-> initial-state
+          (assoc-in [:index  :page]   (:page progress))
+          (assoc-in [:index  :result] (:index progress))
+          (assoc-in [:params :genre]  (:genre progress))
+          (assoc-in [:params :style]  (:style progress))
+          (assoc-in [:params :year]   (:year progress))
+          (vector :ok))
 
-        (:errors options)
-        (do (run! print-error (:errors options))
-            (print-summary summary)
-            (System/exit 1))
+      (or (empty? *command-line-args*) (:help options))
+      [nil :no-args]
 
-        (nil? (:genre options))
-        (do (print-error "Please specify a genre")
-            (print-summary summary)
-            (System/exit 1))))
+      (:errors options)
+      [nil :error (:errors options)]
 
-(defn run-effect! [state [effect callback]]
-  (cond-> (case effect
-            :refetch (fetch-current-resource! state)
-            :forward (forward! state)
-            :back    (back! state))
-    callback (callback)))
+      (and (:resume options) (nil? (:genre options)))
+      [nil :error ["No progress found in database, cannot resume"
+                   "Please specify a genre"]]
+
+      (:resume options)
+      [nil :error ["No progress found in database, cannot resume"]]
+
+      (nil? (:genre options))
+      [nil :error ["Please specify a genre"]]
+
+      :else
+      [initial-state :ok])))
 
 (defn read-loop! []
   (loop []
@@ -672,17 +713,6 @@
           (when-not (identical? state state'')
             (reset! state* state''))
           (recur))))))
-
-(defn resolve-state! []
-  (let [progress (when (:resume (:options cli-opts))
-                   (some-> $conn
-                           (?progress-by-key (state->progress initial-state))
-                           (entity->map)))]
-    (if (some? progress)
-      (-> initial-state
-          (assoc-in [:index :page]   (:page progress))
-          (assoc-in [:index :result] (:index progress)))
-      initial-state)))
 
 ;; Process ---------------------------------------------------------------------
 
@@ -701,14 +731,16 @@
 ;; Main
 
 (defn mount! []
-  (add-watch state* ::browse browse!)
-  (add-watch state* ::play   play!)
-  (add-watch state* ::save   save-progress!)
-  (add-watch state* ::render render!)
-  (reset! state* (resolve-state!)))
+  (let [[state status errors] (resolve-state! cli-opts)]
+    (case status
+      :no-args (do (print-summary (:summary cli-opts))
+                   (System/exit 0))
+      :error   (do (run! print-error errors)
+                   (print-summary (:summary cli-opts))
+                   (System/exit 1))
+      :ok      (do (watch!) (reset! state* state)))))
 
 (defn main! []
-  (check-args! cli-opts)
   (mount!)
   (let [state (fetch-page! @state*)
         ok?   (seq (:results (:data state)))
