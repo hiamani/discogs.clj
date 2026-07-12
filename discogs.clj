@@ -267,8 +267,8 @@
 (defn entity->resource [entity]
   (-> entity
       (entity->map)
-      (update :artists (partial map entity->map))
-      (update :videos  (partial map entity->map))))
+      (update :artists (partial mapv entity->map))
+      (update :videos  (partial mapv entity->map))))
 
 ;; Queries
 
