@@ -21,8 +21,6 @@
 
 (def mpv-exists? (try-mpv!))
 
-(def player* (atom nil))
-
 ;; tty helpers
 
 (defn stty [args {:keys [read?]}]
@@ -75,17 +73,19 @@
 
 (def initial-state
   (let [{:keys [genre style year page index]} (:options cli-opts)]
-    {:params {:genre genre
-              :style style
-              :year  year}
-     :index  {:result  index
-              :page    page
-              :video   0
-              :playing nil}
-     :data   {:results  nil
-              :resource nil}
-     :view   {:key   :init
-              :props {:status :fetching}}}))
+    {:id      -1
+     :params  {:genre genre
+               :style style
+               :year  year}
+     :index   {:result  index
+               :page    page
+               :video   0
+               :playing nil}
+     :data    {:results  nil
+               :resource nil}
+     :view    {:key   :init
+               :props {:status :fetching}}
+     :effects {:browse-uri nil}}))
 
 (def state* (atom initial-state))
 
@@ -324,12 +324,14 @@
                              (?resource-by-url $conn (:resource_url result))))]
       (-> state
           (assoc-in [:data :resource] cached)
-          (assoc-in [:index :video] 0))
+          (assoc-in [:index :video] 0)
+          (update :id inc))
       (let [resource (some-> result (fetch-resource!))]
         (some-> $conn (transact-resource! resource))
         (-> state
             (assoc-in [:data :resource] resource)
-            (assoc-in [:index :video] 0))))))
+            (assoc-in [:index :video] 0)
+            (update :id inc))))))
 
 (defn forward! [{:keys [index data] :as state}]
   (let [next-index (inc (:result index))
@@ -414,18 +416,6 @@
     mpv-exists?
     (conj (str "    Press " (yellow "Space") " to play/pause audio."))))
 
-(defn video-lines [{:keys [index] :as _state} video-index video]
-  (let [uri-display (str (when (= video-index (:playing index)) "▶ ") (:uri video))
-        dur-display (str "[" (int (/ (:duration video) 60)) "m"
-                         (format "%02d" (mod (:duration video) 60)) "s" "]")]
-    (if (= video-index (:video index))
-      [(line " "   (green (bold (str "> " (:title video)))))
-       (line "   " (green (bold uri-display)))
-       (line "   " (green (bold dur-display)))]
-      [(line "  -" (:title video))
-       (line "   " uri-display)
-       (line "   " dur-display)])))
-
 (defn index-of-lines [{:keys [index data] :as _state}]
   (let [index-of (str "(" (inc (:result index)) " of " (count (:results data)) ")")]
     [(line "-----------" "Page" (:page index) index-of "-----------")]))
@@ -447,6 +437,18 @@
              (line "Want:   " (:want (:community result)))])
       $conn
       (conj (line "Seen:   " (if (:cached? resource) (green "Yes") "No"))))))
+
+(defn video-lines [{:keys [index] :as _state} video-index video]
+  (let [uri-display (str (when (= video-index (:playing index)) "▶ ") (:uri video))
+        dur-display (str "[" (int (/ (:duration video) 60)) "m"
+                         (format "%02d" (mod (:duration video) 60)) "s" "]")]
+    (if (= video-index (:video index))
+      [(line " "   (green (bold (str "> " (:title video)))))
+       (line "   " (green (bold uri-display)))
+       (line "   " (green (bold dur-display)))]
+      [(line "  -" (:title video))
+       (line "   " uri-display)
+       (line "   " dur-display)])))
 
 (defn resource-lines [{:keys [data index] :as state}]
   (let [resource (:resource data)]
@@ -485,43 +487,19 @@
       (some? status)   (conj (get init-statuses status))
       (= :done status) (into (instruction-lines state)))))
 
-;; Render
-
-(defn render! [{:keys [view] :as state}]
-  (let [lines (case (:key view)
-                :init      (init-lines state)
-                :resources (into (resource-lines state)
-                                 (instruction-lines state)))
-        frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
-    (print frame)
-    (flush)))
-
 ;; Handlers --------------------------------------------------------------------
-
-(defn destroy-player! []
-  (when-let [p @player*]
-    (.destroy p)
-    (reset! player* nil)))
-
-(defn play-video! [state video]
-  (let [args   ["mpv" "--no-video" "--really-quiet" (:uri video)]
-        player (-> (ProcessBuilder. args) (.start))]
-    (reset! player* player)
-    (assoc-in state [:index :playing] (:video (:index state)))))
 
 (defn handle-n-p [{:keys [view data] :as state} input]
   (if (some? (:results data))
-    (let [init-view (= :init (:key view))
-          state'    (cond init-view          (fetch-current-resource! state)
-                          (= input (int \n)) (forward! state)
-                          :else              (back! state))
-          state'    (-> state'
-                        (assoc-in [:index :playing] nil)
-                        (assoc :view {:key :resources}))
-          progress (state->progress state')]
-      (some-> $conn (transact-progress! progress))
-      (destroy-player!)
-      state')
+    (let [init? (= :init (:key view))
+          next? (= input (int \n))
+          state'    (cond init? (fetch-current-resource! state)
+                          next? (forward! state)
+                          :else (back! state))]
+      (-> state'
+          (assoc-in [:index :playing] nil)
+          (assoc :view {:key :resources})
+          (update :id inc)))
     (do (println "[i] No more resources!")
         state)))
 
@@ -549,10 +527,9 @@
         no-mpv (not mpv-exists?)]
     (cond
       no-mpv state
-      video  (do (destroy-player!)
-                 (if (= (:video index) (:playing index))
-                   (assoc-in state [:index :playing] nil)
-                   (play-video! state video)))
+      video  (if (= (:video index) (:playing index))
+               (assoc-in state [:index :playing] nil)
+               (assoc-in state [:index :playing] (:video index)))
       :else  state)))
 
 (defn handle-input [state input]
@@ -564,6 +541,45 @@
       (= input (int \newline)) (handle-enter state input)
       (= input (int \space))   (handle-space state input)
       :else state)))
+
+;; Watchers --------------------------------------------------------------------
+
+;; Player
+
+(def player* (atom nil))
+
+(defn destroy-player! []
+  (when-let [p @player*]
+    (.destroy p)
+    (reset! player* nil)))
+
+(defn play-video! [uri]
+  (let [args   ["mpv" "--no-video" "--really-quiet" uri]
+        player (-> (ProcessBuilder. args) (.start))]
+    (reset! player* player)))
+
+(defn play! [_ _ prev {:keys [data index]}]
+  (when (not= (:playing (:index prev)) (:playing index))
+    (destroy-player!)
+    (when-let [idx (:playing index)]
+      (some-> data :resource :videos (nth idx nil) :uri (play-video!)))))
+
+;; Progress transactor
+
+(defn save-progress! [_ _ prev next]
+  (when (and (not= (:id prev) (:id next)) (< 0 (:id next)))
+    (some-> $conn (transact-progress! (state->progress next)))))
+
+;; Renderer
+
+(defn render! [_ _ _ {:keys [view] :as state}]
+  (let [lines (case (:key view)
+                :init      (init-lines state)
+                :resources (into (resource-lines state)
+                                 (instruction-lines state)))
+        frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
+    (print frame)
+    (flush)))
 
 ;; Initialization --------------------------------------------------------------
 
@@ -583,7 +599,7 @@
             (print-summary summary)
             (System/exit 1))))
 
-(defn resolve-state []
+(defn resolve-state! []
   (let [progress (when (:resume (:options cli-opts))
                    (some-> $conn
                            (?progress-by-key (state->progress initial-state))
@@ -621,8 +637,10 @@
 ;; Main
 
 (defn mount! []
-  (render! (reset! state* (resolve-state)))
-  (add-watch state* ::render (fn [_ _ _ next] (render! next))))
+  (add-watch state* ::render render!)
+  (add-watch state* ::play play!)
+  (add-watch state* ::save-progress save-progress!)
+  (reset! state* (resolve-state!)))
 
 (defn main! []
   (check-args! cli-opts)
