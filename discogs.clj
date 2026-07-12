@@ -596,8 +596,10 @@
   (loop []
     (let [input (read-char)]
       (when-not (= input (int \q))
-        (let [state @state*]
-          (reset! state* (handle-input state input))
+        (let [state  @state*
+              state' (handle-input state input)]
+          (when-not (identical? state state')
+            (reset! state* state'))
           (recur))))))
 
 ;; Process ---------------------------------------------------------------------
