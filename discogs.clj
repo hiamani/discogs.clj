@@ -310,6 +310,17 @@
 (defn transact-progress! [conn progress]
   (d/transact! conn [(progress->entity progress)]))
 
+;; Helpers ---------------------------------------------------------------------
+
+(defn current-result [{:keys [data index] :as _state}]
+  (nth (:results data) (:result index) nil))
+
+(defn video-by-index [{:keys [data] :as _state} video-index]
+  (some-> data :resource :videos (nth video-index nil)))
+
+(defn current-video [{:keys [index] :as state}]
+  (video-by-index state (:video index)))
+
 ;; Effects ---------------------------------------------------------------------
 
 (defn fetch-page! [{:keys [params index] :as state}]
@@ -322,8 +333,7 @@
         response  (http/get url {:query-params q-params :throw false})]
     (if (= 200 (:status response))
       (let [body    (json/parse-string (:body response) true)
-            results (when (seq (:results body))
-                      (:results body))]
+            results (not-empty (:results body))]
         (some-> $conn (transact-results! results))
         (assoc-in state [:data :results] results))
       (assoc-in state [:data :results] nil))))
@@ -336,8 +346,8 @@
     (or (fetch! (:master_url result) true)
         (fetch! (:resource_url result) false))))
 
-(defn fetch-current-resource! [{:keys [data index] :as state}]
-  (let [result (nth (:results data) (:result index) nil)]
+(defn fetch-current-resource! [state]
+  (let [result (current-result state)]
     (if-let [cached (and $conn result
                          (or (?resource-by-url $conn (:master_url result))
                              (?resource-by-url $conn (:resource_url result))))]
@@ -430,7 +440,7 @@
      (line (green ">") "Using database at:" db-path)
      (line (yellow ">") "Skipping database connection"))])
 
-(defn instruction-lines [_state]
+(def instruction-lines
   (cond-> [""
            (line (blue "[?]") "Press" (yellow "n") "for next release," (yellow "p") "for previous," (yellow "q") "to quit.")
            (line "   " "To navigate videos, press" (yellow "j") "to go down," (yellow "k") "to go up.")
@@ -442,8 +452,8 @@
   (let [index-of (str "(" (inc (:result index)) " of " (count (:results data)) ")")]
     [(line "-----------" "Page" (:page index) index-of "-----------")]))
 
-(defn header-lines [{:keys [index data params] :as state}]
-  (let [result   (nth (:results data) (:result index))
+(defn header-lines [{:keys [data params] :as state}]
+  (let [result   (current-result state)
         resource (:resource data)]
     (cond-> (index-of-lines state)
       :always
@@ -460,11 +470,11 @@
       $conn
       (conj (line "Seen:   " (if (:cached? resource) (green "Yes") "No"))))))
 
-(defn video-lines [{:keys [index] :as _state} video-index video]
-  (let [uri-display (str (when (= video-index (:playing index)) "▶ ") (:uri video))
+(defn video-lines [{:keys [index] :as _state} idx video]
+  (let [uri-display (str (when (= idx (:playing index)) "▶ ") (:uri video))
         dur-display (str "[" (int (/ (:duration video) 60)) "m"
                          (format "%02d" (mod (:duration video) 60)) "s" "]")]
-    (if (= video-index (:video index))
+    (if (= idx (:video index))
       [(line " "   (green (bold (str "> " (:title video)))))
        (line "   " (green (bold uri-display)))
        (line "   " (green (bold dur-display)))]
@@ -472,29 +482,40 @@
        (line "   " uri-display)
        (line "   " dur-display)])))
 
-(defn resource-lines [{:keys [data index] :as state}]
-  (let [resource (:resource data)]
-    (if-not resource
+(defn video-range [total capacity selected]
+  (let [half   (quot capacity 2)
+        center (- selected half)
+        clamp  (max 0 center)
+        start  (min clamp (max 0 (- total capacity)))
+        end    (min total (+ start capacity))]
+    [start end]))
+
+(defn videos-lines [{:keys [data index] :as state} capacity]
+  (let [videos      (:videos (:resource data))
+        total       (count videos)
+        [start end] (video-range total capacity (:video index))]
+    (into [(line "Videos:" (when (> total capacity)
+                             (str " (" (inc start) "-" end " of " total ")")))]
+          (mapcat #(video-lines state % (nth videos %))
+                  (range start end)))))
+
+(defn video-capacity [header]
+  (let [reserved (+ (count header) (count instruction-lines) 1)]
+    (max 1 (quot (- (term-rows) reserved) 3))))
+
+(defn resource-lines [{:keys [data] :as state}]
+  (let [resource (:resource data)
+        videos   (:videos resource)
+        header   (header-lines state)]
+    (cond
+      (not resource)
       (conj (index-of-lines state) (line (red "[!] No resource found!")))
-      (let [header (header-lines state)
-            videos (vec (:videos resource))]
-        (if-not (seq videos)
-          (conj header (red "(No Videos)"))
-          (let [reserved (+ (count header) (count (instruction-lines state)) 1)
-                visible  (max 1 (quot (- (term-rows) reserved) 3))
-                total    (count videos)
-                v-index  (:video index)
-                half     (quot visible 2)
-                start    (-> (- v-index half)
-                             (max 0)
-                             (min (max 0 (- total visible))))
-                end      (min total (+ start visible))]
-            (-> header
-                (conj (line "Videos:"
-                            (when (> total visible)
-                              (str "(" (inc start) "-" end " of " total ")"))))
-                (into (mapcat #(video-lines state % (nth videos %))
-                              (range start end))))))))))
+
+      (empty? videos)
+      (conj header (red "(No Videos)"))
+
+      :else
+      (into header (videos-lines state (video-capacity header))))))
 
 (def init-statuses
   {:fetching (str (green ">") " Fetching initial results...")
@@ -507,7 +528,7 @@
       (not mpv-exists?)
       (conj (red "> mpv not found - audio playback disabled"))
       (some? status)   (conj (get init-statuses status))
-      (= :done status) (into (instruction-lines state)))))
+      (= :done status) (into instruction-lines))))
 
 ;; Handlers --------------------------------------------------------------------
 
@@ -536,14 +557,14 @@
       (assoc-in state [:index :video] video-index))
     state))
 
-(defn handle-enter [{:keys [data index] :as state} _input]
-  (let [uri (some-> data :resource :videos (nth (:video index) nil) :uri)]
+(defn handle-enter [state _input]
+  (let [uri (some-> (current-video state) :uri)]
     (-> state
         (assoc-in [:effects :browse-uri] uri)
         (update-in [:effects :browse-id] inc))))
 
-(defn handle-space [{:keys [data index] :as state} _input]
-  (let [video (nth (:videos (:resource data)) (:video index) nil)
+(defn handle-space [{:keys [index] :as state} _input]
+  (let [video  (current-video state)
         no-mpv (not mpv-exists?)]
     (cond
       no-mpv state
@@ -587,11 +608,11 @@
         player (-> (ProcessBuilder. args) (.start))]
     (reset! player* player)))
 
-(defn play! [_ _ prev {:keys [data index]}]
+(defn play! [_ _ prev {:keys [index] :as next}]
   (when (not= (:playing (:index prev)) (:playing index))
     (destroy-player!)
     (when-let [idx (:playing index)]
-      (some-> data :resource :videos (nth idx nil) :uri (play-video!)))))
+      (some-> (video-by-index next idx) :uri (play-video!)))))
 
 ;; Progress transactor
 
@@ -604,8 +625,7 @@
 (defn render! [_ _ _ {:keys [view] :as state}]
   (let [lines (case (:key view)
                 :init      (init-lines state)
-                :resources (into (resource-lines state)
-                                 (instruction-lines state)))
+                :resources (into (resource-lines state) instruction-lines))
         frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
     (print frame)
     (flush)))
