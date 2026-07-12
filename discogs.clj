@@ -4,7 +4,8 @@
 
 (pods/load-pod 'huahaiy/datalevin "0.10.16")
 
-(require '[babashka.http-client :as http]
+(require '[babashka.fs :as fs]
+         '[babashka.http-client :as http]
          '[cheshire.core :as json]
          '[clojure.string :as str]
          '[clojure.tools.cli :refer [parse-opts]]
@@ -64,6 +65,7 @@
    ["-p" "--page PAGE"     "Starting page"  :parse-fn parse-page :default 1]
    ["-i" "--index INDEX"   "Starting index" :parse-fn parse-index :default 0]
    ["-d" "--database PATH" "Database path"]
+   ["-x" "--no-database"   "Skip database connection"]
    ["-r" "--resume"        "Resume session"]])
 
 (def cli-opts
@@ -193,9 +195,21 @@
 
 ;; Connection
 
+(defn default-db-path []
+  (let [home     (System/getProperty "user.home")
+        xdg-data (System/getenv "XDG_DATA_HOME")]
+    (if (not-empty xdg-data)
+      (str (fs/path xdg-data "discogs" "db"))
+      (str (fs/path home ".local" "share" "discogs" "db")))))
+
+(def db-path
+  (or (:database (:options cli-opts))
+      (default-db-path)))
+
 (def $conn
-  (when-let [path (:database (:options cli-opts))]
-    (d/get-conn path schema)))
+  (when-not (:no-database (:options cli-opts))
+    (.mkdirs (java.io.File. db-path))
+    (d/get-conn db-path schema)))
 
 ;; Transformers
 
@@ -407,7 +421,10 @@
    (line (green ">")
          "Starting at page"
          (str (:page index) ", index")
-         (inc (:result index)))])
+         (inc (:result index)))
+   (if-not (:no-database (:options cli-opts))
+     (line (green ">") "Using database at:" db-path)
+     (line (yellow ">") "Skipping database connection"))])
 
 (defn instruction-lines [_state]
   (cond-> [""
