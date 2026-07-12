@@ -690,10 +690,6 @@
       (:errors options)
       [nil :error (:errors options)]
 
-      (and (:resume options) (nil? (:genre options)))
-      [nil :error ["No progress found in database, cannot resume"
-                   "Please specify a genre"]]
-
       (:resume options)
       [nil :error ["No progress found in database, cannot resume"]]
 
