@@ -64,9 +64,10 @@
    ["-y" "--year YEAR"     "Year"]
    ["-p" "--page PAGE"     "Starting page"  :parse-fn parse-page :default 1]
    ["-i" "--index INDEX"   "Starting index" :parse-fn parse-index :default 0]
+   ["-r" "--resume"        "Resume last session"]
+   ["-l" "--list"          "List and pick sessions"]
    ["-d" "--database PATH" "Database path"]
-   ["-x" "--no-database"   "Skip database connection"]
-   ["-r" "--resume"        "Resume last session"]])
+   ["-x" "--no-database"   "Skip database connection"]])
 
 (def cli-opts
   (parse-opts *command-line-args* cli-config))
@@ -76,16 +77,18 @@
 (def initial-state
   (let [{:keys [genre style year page index]} (:options cli-opts)]
     {:id      -1
-     :params   {:genre genre
-                :style style
-                :year  year}
-     :index    {:result index
-                :page   page
-                :video  0}
-     :data     {:results  nil
-                :resource nil}
-     :view     {:key   :init
-                :props {:status :fetching}}
+     :params  {:genre genre
+               :style style
+               :year  year}
+     :index   {:result  index
+               :page    page
+               :video   0
+               :session 0}
+     :data    {:results  nil
+               :resource nil
+               :sessions nil}
+     :view    {:key   :init
+               :props {:status :fetching}}
      :actions {:play-video nil
                :browse-uri nil
                :browse-id  0}}))
@@ -226,7 +229,9 @@
       (update-keys #(keyword (name ns') (name %)))))
 
 (defn entity->map [ent]
-  (update-keys (dissoc ent :db/id) (comp keyword name)))
+  (-> ent
+      (dissoc :db/id :meta/created-at)
+      (update-keys (comp keyword name))))
 
 (defn result->entity [result]
   (let [ks [:id :genre :style :type :master_url :resource_url
@@ -279,30 +284,29 @@
 
 (defn ?resource-by-url [db resource_url]
   (some-> (d/q '[:find (pull ?e [* {:resource/artists [*]
-                                    :resource/videos [*]}])
+                                    :resource/videos [*]}]) .
                  :in $ ?resource_url
                  :where [?e :resource/id ?id]
                  [?e :resource/resource_url ?resource_url]]
                db
                resource_url)
-          (ffirst)
           (entity->resource)
           (assoc :cached? true)))
 
 (defn ?progress-by-key [db progress]
-  (some-> (d/q '[:find (pull ?e [*])
+  (some-> (d/q '[:find (pull ?e [*]) .
                  :in $ ?key
                  :where [?e :progress/key ?key]]
                db
                (progress-key progress))
-          (ffirst)))
+          (entity->map)))
 
 (defn ?progress-list [db]
-  (some->> (d/q '[:find (pull ?e [*])
+  (some->> (d/q '[:find [(pull ?e [*]) ...]
                   :in $
                   :where [?e :progress/key]]
                 db)
-           (map first)))
+           (map entity->map)))
 
 (defn ?last-progress-inst [db]
   (d/q '[:find (max ?t) .
@@ -312,11 +316,12 @@
 
 (defn ?last-progress [db]
   (let [t (?last-progress-inst db)]
-    (d/q '[:find (pull ?e [*]) .
-           :in $ ?t
-           :where [?e :meta/created-at ?t]
-           [?e :progress/key]]
-         db t)))
+    (some-> (d/q '[:find (pull ?e [*]) .
+                   :in $ ?t
+                   :where [?e :meta/created-at ?t]
+                   [?e :progress/key]]
+                 db t)
+            (entity->map))))
 
 ;; Transactions
 
@@ -339,6 +344,14 @@
 
 (defn current-video [{:keys [index] :as state}]
   (video-by-index state (:video index)))
+
+(defn merge-progress [state progress]
+  (-> state
+      (assoc-in [:index  :page]   (:page progress))
+      (assoc-in [:index  :result] (:index progress))
+      (assoc-in [:params :genre]  (:genre progress))
+      (assoc-in [:params :style]  (:style progress))
+      (assoc-in [:params :year]   (:year progress))))
 
 ;; Effects ---------------------------------------------------------------------
 
@@ -417,8 +430,15 @@
 
       :else state)))
 
+(defn init! [state]
+  (let [state' (fetch-page! state)
+        ok?    (seq (:results (:data state')))]
+    (assoc state' :view {:key :init
+                         :props {:status (if ok? :done :error)}})))
+
 (defn run-effect! [state [effect callback]]
   (cond-> (case effect
+            :init    (init! state)
             :refetch (fetch-current-resource! state)
             :forward (forward! state)
             :back    (back! state))
@@ -426,12 +446,19 @@
 
 ;; Handlers --------------------------------------------------------------------
 
+;; Helpers
+
+(defn n-or-p-input [input]
+  (or (= input (int \n)) (= input (int \p))))
+
+;; General
+
 (defn fetch-callback [state]
   (-> state
       (assoc-in [:actions :play-video] nil)
       (assoc :view {:key :resources})))
 
-(defn handle-n-p [{:keys [view data] :as state} input]
+(defn handle-nav-resource [{:keys [view data] :as state} input]
   (if (some? (:results data))
     (let [init?  (= :init (:key view))
           next?  (= input (int \n))]
@@ -440,27 +467,29 @@
                    :else [:back    fetch-callback])])
     [state nil]))
 
-(defn handle-j [{:keys [data index] :as state} _input]
+;; Resources View
+
+(defn handle-resources-j [{:keys [data index] :as state} _input]
   (if (:resource data)
     (let [videos-length (dec (count (:videos (:resource data))))
           video-index   (min videos-length (inc (:video index)))]
       [(assoc-in state [:index :video] video-index) nil])
     [state nil]))
 
-(defn handle-k [{:keys [data index] :as state} _input]
+(defn handle-resources-k [{:keys [data index] :as state} _input]
   (if (:resource data)
     (let [video-index (max 0 (dec (:video index)))]
       [(assoc-in state [:index :video] video-index) nil])
     [state nil]))
 
-(defn handle-enter [state _input]
+(defn handle-resources-enter [state _input]
   (let [uri (some-> (current-video state) :uri)]
     [(-> state
          (assoc-in [:actions :browse-uri] uri)
          (update-in [:actions :browse-id] inc))
      nil]))
 
-(defn handle-space [{:keys [index actions] :as state} _input]
+(defn handle-resources-space [{:keys [index actions] :as state} _input]
   (let [video  (current-video state)
         no-mpv (not mpv-exists?)]
     (cond
@@ -471,15 +500,55 @@
               nil]
       :else  [state nil])))
 
+(defn handle-resources-input [state input]
+  (cond
+    (n-or-p-input input)     (handle-nav-resource state input)
+    (= input (int \j))       (handle-resources-j state input)
+    (= input (int \k))       (handle-resources-k state input)
+    (= input (int \newline)) (handle-resources-enter state input)
+    (= input (int \space))   (handle-resources-space state input)
+    :else                    [state nil]))
+
+;; Init View
+
+(defn handle-init-input [state input]
+  (cond
+    (n-or-p-input input) (handle-nav-resource state input)
+    :else                [state nil]))
+
+;; Sessions View
+
+(defn handle-sessions-j [{:keys [data index] :as state} _input]
+  (let [sessions-length (dec (count (:sessions data)))
+        session-index   (min sessions-length (inc (:session index)))]
+    [(assoc-in state [:index :session] session-index) nil]))
+
+(defn handle-sessions-k [{:keys [index] :as state} _input]
+  (let [session-index (max 0 (dec (:session index)))]
+    [(assoc-in state [:index :session] session-index) nil]))
+
+(defn handle-sessions-enter [{:keys [index data] :as state} _input]
+  (let [session (nth (:sessions data) (:session index))]
+    (-> state
+        (merge-progress session)
+        (assoc :view {:key :init :props {:status :fetching}})
+        (vector [:init]))))
+
+(defn handle-sessions-input [state input]
+  (cond
+    (= input (int \j))       (handle-sessions-j state input)
+    (= input (int \k))       (handle-sessions-k state input)
+    (= input (int \newline)) (handle-sessions-enter state input)
+    :else                    [state nil]))
+
+;; Main
+
 (defn handle-input [state input]
-  (let [n-or-p-input (or (= input (int \n)) (= input (int \p)))]
-    (cond
-      n-or-p-input             (handle-n-p state input)
-      (= input (int \j))       (handle-j state input)
-      (= input (int \k))       (handle-k state input)
-      (= input (int \newline)) (handle-enter state input)
-      (= input (int \space))   (handle-space state input)
-      :else                    [state nil])))
+  (case (:key (:view state))
+    :sessions  (handle-sessions-input state input)
+    :init      (handle-init-input state input)
+    :resources (handle-resources-input state input)
+    [state nil]))
 
 ;; Display ---------------------------------------------------------------------
 
@@ -602,6 +671,22 @@
       :else
       (into header (videos-lines state header)))))
 
+(defn session-item-lines [{:keys [genre style year page index]}]
+  [(line "- Genre:" (str/capitalize genre) "|"
+         "Style:" (str/capitalize style) "|"
+         "Year:"  year)
+   (line (str "  [Page: " page ", " "Index: " (inc index) "]"))])
+
+(defn session-list-lines [{:keys [data index] :as _state}]
+  (mapcat (fn [idx]
+            (let [session  (nth (:sessions data) idx)
+                  current? (= idx (:session index))
+                  style    (if current? (comp green bold) identity)]
+              (map style (session-item-lines session))))
+          (range (count (:sessions data)))))
+
+(defn sessions-lines [{:keys [data]}])
+
 (def init-statuses
   {:fetching (str (green ">") " Fetching initial results...")
    :done     (str (green ">") " Fetching initial results... Done!")
@@ -657,6 +742,7 @@
 
 (defn render! [_ _ _ {:keys [view] :as state}]
   (let [lines (case (:key view)
+                :sessions  (session-list-lines state)
                 :init      (init-lines state)
                 :resources (into (resource-lines state) instruction-lines))
         frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
@@ -673,18 +759,26 @@
 
 ;; Initialization --------------------------------------------------------------
 
+(defn resolve-progress! [options]
+  (when (and (:resume options) (not (:no-database options)))
+    (some-> $conn d/db (?last-progress))))
+
+(defn resolve-sessions! [options]
+  (when (and (:list options) (not (:no-database options)))
+    (some-> $conn d/db (?progress-list))))
+
 (defn resolve-state! [{:keys [options]}]
-  (let [progress (when (:resume options)
-                   (some-> $conn d/db (?last-progress) (entity->map)))]
+  (let [sessions (resolve-sessions! options)
+        progress (when-not sessions (resolve-progress! options))]
     (cond
-      (some? progress)
+      (some? sessions)
       (-> initial-state
-          (assoc-in [:index  :page]   (:page progress))
-          (assoc-in [:index  :result] (:index progress))
-          (assoc-in [:params :genre]  (:genre progress))
-          (assoc-in [:params :style]  (:style progress))
-          (assoc-in [:params :year]   (:year progress))
+          (assoc :view {:key :sessions})
+          (assoc-in [:data :sessions] sessions)
           (vector :ok))
+
+      (some? progress)
+      [(merge-progress initial-state progress) :ok]
 
       (or (empty? *command-line-args*) (:help options))
       [nil :no-args]
@@ -701,15 +795,20 @@
       :else
       [initial-state :ok])))
 
+(defn transition! [state [next fx]]
+  (when-not (identical? state next)
+    (reset! state* next))
+  (let [final (if fx (run-effect! next fx) next)]
+    (when-not (identical? next final)
+      (reset! state* final))))
+
 (defn read-loop! []
   (loop []
     (let [input (read-char)]
       (when-not (= input (int \q))
-        (let [state       @state*
-              [state' fx] (handle-input state input)
-              state''     (if fx (run-effect! state' fx) state')]
-          (when-not (identical? state state'')
-            (reset! state* state''))
+        (let [state @state*
+              [next fx] (handle-input state input)]
+          (transition! state [next fx])
           (recur))))))
 
 ;; Process ---------------------------------------------------------------------
@@ -740,12 +839,11 @@
 
 (defn main! []
   (mount!)
-  (let [state (fetch-page! @state*)
-        ok?   (seq (:results (:data state)))
-        view  {:key :init :props {:status (if ok? :done :error)}}]
-    (reset! state* (assoc state :view view))
-    (when ok?
-      (read-loop!))))
+  (case (get-in @state* [:view :key])
+    :init     (reset! state* (run-effect! @state* [:init]))
+    :sessions nil
+    nil)
+  (read-loop!))
 
 ;; Run
 
