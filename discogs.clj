@@ -12,6 +12,8 @@
          '[clojure.java.browse :refer [browse-url]]
          '[pod.huahaiy.datalevin :as d])
 
+(import '[java.time Instant Duration])
+
 ;; Processes -------------------------------------------------------------------
 
 (defn try-mpv! []
@@ -76,7 +78,7 @@
 
 (def initial-state
   (let [{:keys [genre style year page index]} (:options cli-opts)]
-    {:id      -1
+    {:id      0
      :params  {:genre genre
                :style style
                :year  year}
@@ -230,7 +232,7 @@
 
 (defn entity->map [ent]
   (-> ent
-      (dissoc :db/id :meta/created-at)
+      (dissoc :db/id)
       (update-keys (comp keyword name))))
 
 (defn result->entity [result]
@@ -306,6 +308,7 @@
                   :in $
                   :where [?e :progress/key]]
                 db)
+           (sort-by :meta/created-at #(compare %2 %1))
            (map entity->map)))
 
 (defn ?last-progress-inst [db]
@@ -352,6 +355,21 @@
       (assoc-in [:params :genre]  (:genre progress))
       (assoc-in [:params :style]  (:style progress))
       (assoc-in [:params :year]   (:year progress))))
+
+(defn relative-time [date]
+  (let [then (.toInstant date)
+        secs (.getSeconds (Duration/between then (Instant/now)))
+        mins (quot secs 60)
+        hrs  (quot mins 60)
+        days (quot hrs 24)]
+    (cond
+      (< secs 60)  "just now"
+      (< mins 60)  (str mins "m ago")
+      (< hrs 24)   (str hrs "h ago")
+      (< days 7)   (str days "d ago")
+      (< days 30)  (str (quot days 7) "w ago")
+      (< days 365) (str (quot days 30) "mo ago")
+      :else        (str (quot days 365) "y ago"))))
 
 ;; Effects ---------------------------------------------------------------------
 
@@ -578,14 +596,14 @@
 (defn line [& parts]
   (str/join " " (map str parts)))
 
+(defn welcome-message [{:keys [genre style year] :as _params}]
+  (let [parts (cond-> ["Welcome! Querying Discogs for genre" (green (str/capitalize genre))]
+                style (into ["in style" (green (str/capitalize style))])
+                year  (into ["from" (green year)]))]
+    (apply line parts)))
+
 (defn welcome-lines [{:keys [params index]}]
-  [(if (:style params)
-     (line "Welcome! Querying Discogs for style"
-           (green (str/capitalize (:style params)))
-           "in genre"
-           (green (str/capitalize (:genre params))))
-     (line "Welcome! Querying Discogs for genre"
-           (green (str/capitalize (:genre params)))))
+  [(welcome-message params)
    (line (green ">")
          "Starting at page"
          (str (:page index) ", index")
@@ -671,21 +689,28 @@
       :else
       (into header (videos-lines state header)))))
 
-(defn session-item-lines [{:keys [genre style year page index]}]
-  [(line "- Genre:" (str/capitalize genre) "|"
+(defn session-item-lines [{:keys [genre style year page index] :as session} current?]
+  [(line (if current? ">" "-")
+         "Genre:" (str/capitalize genre) "|"
          "Style:" (str/capitalize style) "|"
          "Year:"  year)
-   (line (str "  [Page: " page ", " "Index: " (inc index) "]"))])
+   (line "  Page:" page "-" "Index:" (inc index))
+   (line "  Updated:" (relative-time (:created-at session)))])
 
 (defn session-list-lines [{:keys [data index] :as _state}]
   (mapcat (fn [idx]
             (let [session  (nth (:sessions data) idx)
                   current? (= idx (:session index))
                   style    (if current? (comp green bold) identity)]
-              (map style (session-item-lines session))))
+              (map style (session-item-lines session current?))))
           (range (count (:sessions data)))))
 
-(defn sessions-lines [{:keys [data]}])
+(defn sessions-lines [{:keys [data index] :as state}]
+  (let [idx (+ (:session index) 1)
+        len (count (:sessions data))]
+    (into [(line "Welcome! Choose a session to resume:"
+                 (str "(" idx " of " len ")"))]
+          (session-list-lines state))))
 
 (def init-statuses
   {:fetching (str (green ">") " Fetching initial results...")
@@ -742,7 +767,7 @@
 
 (defn render! [_ _ _ {:keys [view] :as state}]
   (let [lines (case (:key view)
-                :sessions  (session-list-lines state)
+                :sessions  (sessions-lines state)
                 :init      (init-lines state)
                 :resources (into (resource-lines state) instruction-lines))
         frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
