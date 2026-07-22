@@ -24,7 +24,7 @@
 
 (def mpv-exists? (try-mpv!))
 
-;; tty helpers
+;; tty Helpers
 
 (defn stty [args {:keys [read?]}]
   (let [proc (-> (ProcessBuilder. (into ["stty"] args))
@@ -376,7 +376,7 @@
 
 ;; Effects ---------------------------------------------------------------------
 
-; API Calls
+;; API Calls
 
 (defn fetch-page! [{:keys [params index] :as state}]
   (let [url      "https://api.discogs.com/database/search"
@@ -401,27 +401,30 @@
     (or (some-> (fetch! master_url) (assoc :master? true))
         (some-> (fetch! resource_url) (assoc :master? false)))))
 
+;; Cache Helper
+
 (defn find-cached-result! [result]
   (when (and $conn result)
     (let [db (d/db $conn)]
       (or (?resource-by-url db (:master_url result))
           (?resource-by-url db (:resource_url result))))))
 
+;; Resource Helpers
+
 (defn fetch-current-resource! [state]
   (let [result (current-result state)]
-    (if-let [cached (find-cached-result! result)]
-      (-> state
-          (assoc-in [:data :resource] cached)
-          (assoc-in [:index :video] 0)
-          (update :id inc))
-      (let [resource (some-> result (fetch-resource!))]
-        (some-> $conn (transact-resource! resource))
-        (-> state
-            (assoc-in [:data :resource] resource)
-            (assoc-in [:index :video] 0)
-            (update :id inc))))))
+    (or (find-cached-result! result)
+        (when-let [resource (some-> result (fetch-resource!))]
+          (some-> $conn (transact-resource! resource))
+          resource))))
 
-; FX
+(defn set-resource [state resource]
+  (-> state
+      (assoc-in [:data :resource] resource)
+      (assoc-in [:index :video] 0)
+      (update :id inc)))
+
+;; FX
 
 (defn forward! [{:keys [index data] :as state}]
   (let [next-index (inc (:result index))
@@ -432,28 +435,24 @@
                        (assoc-in [:index :result] 0)
                        (fetch-page!))]
         (if (seq (:results (:data state')))
-          (fetch-current-resource! state')
+          (set-resource state' (fetch-current-resource! state'))
           state))
-      (-> state
-          (assoc-in [:index :result] next-index)
-          (fetch-current-resource!)))))
+      (let [state' (assoc-in state [:index :result] next-index)]
+        (set-resource state' (fetch-current-resource! state'))))))
 
 (defn back! [{:keys [index] :as state}]
   (let [prev-index (dec (:result index))]
     (cond
       (>= prev-index 0)
-      (-> state
-          (assoc-in [:index :result] prev-index)
-          (fetch-current-resource!))
+      (let [state' (assoc-in state [:index :result] prev-index)]
+        (set-resource state' (fetch-current-resource! state')))
 
       (> (:page index) 1)
-      (let [state' (-> state
-                       (update-in [:index :page] dec)
-                       (fetch-page!))]
+      (let [state' (fetch-page! (update-in state [:index :page] dec))]
         (if-let [results (not-empty (:results (:data state')))]
-          (-> state'
-              (assoc-in [:index :result] (dec (count results)))
-              (fetch-current-resource!))
+          (let [index   (dec (count results))
+                state'' (assoc-in state' [:index :result] index)]
+            (set-resource state'' (fetch-current-resource! state'')))
           state))
 
       :else state)))
@@ -464,10 +463,12 @@
     (assoc state' :view {:key :init
                          :props {:status (if ok? :done :error)}})))
 
+;; Setup
+
 (defn run-effect! [state [effect callback]]
   (cond-> (case effect
             :init    (init! state)
-            :refetch (fetch-current-resource! state)
+            :refetch (set-resource state (fetch-current-resource! state))
             :forward (forward! state)
             :back    (back! state))
     callback (callback)))
@@ -580,7 +581,7 @@
 
 ;; Display ---------------------------------------------------------------------
 
-;; Text styles
+;; Text Styles
 
 (defn bold [s] (str "\033[1m" s "\033[0m"))
 
@@ -595,16 +596,30 @@
 ;; Printing
 
 (defn print-error [s]
-  (println "" (red "[!]") "Error:" s))
+  (println (red "[!]") "Error:" s))
 
 (defn print-summary [summary]
   (println "discogs.clj -- Scrape the Discogs API for release videos")
   (println summary))
 
-;; Lines
+;; Helpers
 
 (defn line [& parts]
   (str/join " " (map str parts)))
+
+(defn list-item-range [total capacity selected]
+  (let [half   (quot capacity 2)
+        center (- selected half)
+        clamp  (max 0 center)
+        start  (min clamp (max 0 (- total capacity)))
+        end    (min total (+ start capacity))]
+    [start end]))
+
+(defn list-capacity [header-len instructions-len item-len]
+  (let [reserved (+ header-len instructions-len)]
+    (max 1 (quot (- (term-rows) reserved) item-len))))
+
+;; Init Lines
 
 (defn welcome-message [{:keys [genre style year] :as _params}]
   (let [prefix "Welcome! Querying Discogs for genre"]
@@ -622,8 +637,30 @@
      (line (green ">") "Using database at:" db-path)
      (line (yellow ">") "Skipping database connection"))])
 
-(def instruction-lines
-  (cond-> [""
+(def init-instructions-lines
+  (cond-> [(line)
+           (line (blue "[?]")
+                 "Press" (yellow "n") "or"
+                 (yellow "p") "to load the first release,"
+                 (yellow "q") "to quit.")]))
+
+(def init-statuses
+  {:fetching (line (green ">") "Fetching initial results...")
+   :done     (line (green ">") "Fetching initial results... Done!")
+   :error    (line (red "[!]") "No initial results!")})
+
+(defn init-lines [state]
+  (let [status (-> state :view :props :status)]
+    (cond-> (welcome-lines state)
+      (not mpv-exists?)
+      (conj (red "> mpv not found - audio playback disabled"))
+      (some? status)   (conj (get init-statuses status))
+      (= :done status) (into init-instructions-lines))))
+
+;; Resource Lines
+
+(def resource-instructions-lines
+  (cond-> [(line)
            (line (blue "[?]")
                  "Press" (yellow "n") "for next release,"
                  (yellow "p") "for previous,"
@@ -638,17 +675,19 @@
     mpv-exists?
     (conj (line "   "  "Press" (yellow "Space") "to play/pause audio."))))
 
-(defn index-of-lines [{:keys [index data] :as _state}]
+(defn resource-index-of-lines [{:keys [index data] :as _state}]
   (let [results-len  (count (:results data))
         result-index (inc (:result index))
-        index-of     (str "(" result-index " of " results-len ")")]
+        index-of     (str "(Release " result-index " of " results-len ")")]
     [(line "-----------" "Page" (:page index) index-of "-----------")]))
 
-(defn header-lines [{:keys [data params] :as state}]
+(defn resource-header-lines [{:keys [data index params] :as state}]
   (let [result      (current-result state)
         resource    (:resource data)
-        param-style (str/capitalize (:style params))]
-    (cond-> (index-of-lines state)
+        param-style (some-> (:style params) (str/capitalize))
+        videos-len  (count (:videos (:resource data)))
+        video-idx   (inc (:video index))]
+    (cond-> (resource-index-of-lines state)
       :always
       (into [(line "Artists:" (str/join ", " (map :name (:artists resource))))
              (line "Title:  " (:title resource))
@@ -658,93 +697,84 @@
              (line "Exact   " (if (= #{param-style} (set (:style result)))
                                 "Yes" "No"))
              (line "Have:   " (:have (:community result)))
-             (line "Want:   " (:want (:community result)))])
+             (line "Want:   " (:want (:community result)))
+             (line "Videos:" (str " (" video-idx " of " videos-len ")"))])
       $conn
       (conj (line "Seen:   " (if (:cached? resource) (green "Yes") "No"))))))
 
-(defn video-lines [{:keys [index actions] :as _state} idx video]
-  (let [uri-display (str (when (= idx (:play-video actions)) "▶ ") (:uri video))
-        dur-display (str "[" (int (/ (:duration video) 60)) "m"
-                         (format "%02d" (mod (:duration video) 60)) "s" "]")]
-    (if (= idx (:video index))
-      [(line " "   (green (bold (str "> " (:title video)))))
-       (line "   " (green (bold uri-display)))
-       (line "   " (green (bold dur-display)))]
-      [(line "  -" (:title video))
-       (line "   " uri-display)
-       (line "   " dur-display)])))
+(defn video-duration-display [duration]
+  (str "[" (int (/ duration 60)) "m" (format "%02d" (mod duration 60)) "s]"))
 
-(defn video-range [total capacity selected]
-  (let [half   (quot capacity 2)
-        center (- selected half)
-        clamp  (max 0 center)
-        start  (min clamp (max 0 (- total capacity)))
-        end    (min total (+ start capacity))]
-    [start end]))
+(defn video-lines [state idx {:keys [uri title duration] :as _video}]
+  (let [current?  (= idx (:video (:index state)))
+        playing?  (= idx (:play-video (:actions state)))]
+    (cond->> [(line " "   (if current? (str "> " title) (str "- " title)))
+              (line "   " (str (when playing? "▶ ") uri))
+              (line "   " (video-duration-display duration))]
+      current? (map (comp bold green)))))
 
-(defn video-capacity [header]
-  (let [reserved (+ (count header) (count instruction-lines) 1)]
-    (max 1 (quot (- (term-rows) reserved) 3))))
-
-(defn videos-lines [{:keys [data index] :as state} header]
+(defn videos-lines [{:keys [data index] :as state} header-len]
   (let [videos      (:videos (:resource data))
         total       (count videos)
-        capacity    (video-capacity header)
-        [start end] (video-range total capacity (:video index))]
-    (into [(line "Videos:" (str " (" (inc (:video index)) " of " total ")"))]
-          (mapcat #(video-lines state % (nth videos %))
-                  (range start end)))))
+        instr-len   (count resource-instructions-lines)
+        capacity    (list-capacity header-len instr-len 3)
+        [start end] (list-item-range total capacity (:video index))]
+    (mapcat #(video-lines state % (nth videos %)) (range start end))))
 
 (defn resource-lines [{:keys [data] :as state}]
   (let [resource (:resource data)
         videos   (:videos resource)
-        header   (header-lines state)]
-    (cond
-      (not resource)
-      (conj (index-of-lines state) (line (red "[!] No resource found!")))
+        header   (resource-header-lines state)]
+    (-> (cond
+          (not resource)
+          (conj (resource-index-of-lines state)
+                (line (red "[!] No resource found!")))
 
-      (empty? videos)
-      (conj header (red "(No Videos)"))
+          (empty? videos)
+          (conj header (red "(No Videos)"))
 
-      :else
-      (into header (videos-lines state header)))))
+          :else
+          (into header (videos-lines state (count header))))
+        (into resource-instructions-lines))))
 
-(defn session-item-lines
-  [{:keys [genre style year page index created-at] :as _session} current?]
-  [(line (if current? ">" "-")
-         "Genre:" (str/capitalize genre) "|"
-         "Style:" (str/capitalize style) "|"
-         "Year:"  year)
-   (line "  Page:" page "-" "Index:" (inc index))
-   (line "  Updated:" (relative-time created-at))])
+;; Sessions
 
-(defn session-list-lines [{:keys [data index] :as _state}]
-  (mapcat (fn [idx]
-            (let [session  (nth (:sessions data) idx)
-                  current? (= idx (:session index))
-                  style    (if current? (comp green bold) identity)]
-              (map style (session-item-lines session current?))))
-          (range (count (:sessions data)))))
+(def session-instructions-lines
+  [(line)
+   (line (blue "[?]")
+         "Press" (yellow "j") "for next session,"
+         (yellow "k") "for previous,"
+         (yellow "q") "to quit.")])
+
+(defn session-item-title [{:keys [genre style year] :as _session}]
+  (str "Genre: " (str/capitalize genre) " | "
+       "Style: " (str/capitalize style) " | "
+       "Year: "  year))
+
+(defn session-item-lines [state idx {:keys [page index created-at] :as session}]
+  (let [current? (= idx (:session (:index state)))
+        title    (session-item-title session)]
+    (cond->> [(line " "   (if current? (str "> " title) (str "- " title)))
+              (line "   " (str "Page: " page " - Release: " (inc index)))
+              (line "   " (str "Updated: " (relative-time created-at)))]
+      current? (map (comp bold green)))))
+
+(defn session-list-lines [{:keys [data index] :as state} header-len]
+  (let [sessions    (:sessions data)
+        total       (count sessions)
+        instr-len   (count session-instructions-lines)
+        capacity    (list-capacity header-len instr-len 3)
+        [start end] (list-item-range total capacity (:session index))]
+    (mapcat #(session-item-lines state % (nth sessions %)) (range start end))))
 
 (defn sessions-lines [{:keys [data index] :as state}]
-  (let [idx (+ (:session index) 1)
-        len (count (:sessions data))]
-    (into [(line "Welcome! Choose a session to resume:"
-                 (str "(" idx " of " len ")"))]
-          (session-list-lines state))))
-
-(def init-statuses
-  {:fetching (str (green ">") " Fetching initial results...")
-   :done     (str (green ">") " Fetching initial results... Done!")
-   :error    (str (red "[!]") " No initial results!")})
-
-(defn init-lines [state]
-  (let [status (-> state :view :props :status)]
-    (cond-> (welcome-lines state)
-      (not mpv-exists?)
-      (conj (red "> mpv not found - audio playback disabled"))
-      (some? status)   (conj (get init-statuses status))
-      (= :done status) (into instruction-lines))))
+  (let [idx    (+ (:session index) 1)
+        len    (count (:sessions data))
+        header [(line "Welcome! Choose a session to resume:"
+                      (str "(" idx " of " len ")"))]]
+    (-> header
+        (into (session-list-lines state (count header)))
+        (into session-instructions-lines))))
 
 ;; Watchers --------------------------------------------------------------------
 
@@ -778,7 +808,7 @@
     (when-let [idx (:play-video (:actions next))]
       (some-> (video-by-index next idx) :uri (play-video!)))))
 
-;; Progress transactor
+;; Progress Transactor
 
 (defn save-progress! [_ _ prev next]
   (when (and (not= (:id prev) (:id next)) (< 0 (:id next)))
@@ -790,7 +820,7 @@
   (let [lines (case (:key view)
                 :sessions  (sessions-lines state)
                 :init      (init-lines state)
-                :resources (into (resource-lines state) instruction-lines))
+                :resources (resource-lines state))
         frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
     (print frame)
     (flush)))
