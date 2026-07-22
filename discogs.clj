@@ -254,7 +254,8 @@
 
 (defn resource->entity [resource]
   (-> resource
-      (select-keys [:id :title :artists :uri :master? :videos :resource_url :year])
+      (select-keys [:id :title :artists :uri :master? :videos
+                    :resource_url :year])
       (update :videos (partial map video->entity))
       (update :artists (partial map artist->entity))
       (map->entity :resource)))
@@ -295,13 +296,15 @@
           (entity->resource)
           (assoc :cached? true)))
 
-(defn ?progress-by-key [db progress]
-  (some-> (d/q '[:find (pull ?e [*]) .
-                 :in $ ?key
-                 :where [?e :progress/key ?key]]
-               db
-               (progress-key progress))
-          (entity->map)))
+;; -- May be used at some point!
+;;
+;; (defn ?progress-by-key [db progress]
+;;   (some-> (d/q '[:find (pull ?e [*]) .
+;;                  :in $ ?key
+;;                  :where [?e :progress/key ?key]]
+;;                db
+;;                (progress-key progress))
+;;           (entity->map)))
 
 (defn ?progress-list [db]
   (some->> (d/q '[:find [(pull ?e [*]) ...]
@@ -373,6 +376,8 @@
 
 ;; Effects ---------------------------------------------------------------------
 
+; API Calls
+
 (defn fetch-page! [{:keys [params index] :as state}]
   (let [url      "https://api.discogs.com/database/search"
         q-params {:genre (:genre params)
@@ -388,20 +393,23 @@
         (assoc-in state [:data :results] results))
       (assoc-in state [:data :results] nil))))
 
-(defn fetch-resource! [result]
-  (letfn [(fetch! [url master?]
+(defn fetch-resource! [{:keys [master_url resource_url] :as _result}]
+  (letfn [(fetch! [url]
             (when-let [resp (some-> url (http/get {:throw false}))]
               (when (= 200 (:status resp))
-                (assoc (json/parse-string (:body resp) true) :master? master?))))]
-    (or (fetch! (:master_url result) true)
-        (fetch! (:resource_url result) false))))
+                (json/parse-string (:body resp) true))))]
+    (or (some-> (fetch! master_url) (assoc :master? true))
+        (some-> (fetch! resource_url) (assoc :master? false)))))
+
+(defn find-cached-result! [result]
+  (when (and $conn result)
+    (let [db (d/db $conn)]
+      (or (?resource-by-url db (:master_url result))
+          (?resource-by-url db (:resource_url result))))))
 
 (defn fetch-current-resource! [state]
   (let [result (current-result state)]
-    (if-let [cached (and $conn result
-                         (let [db (d/db $conn)]
-                           (or (?resource-by-url db (:master_url result))
-                               (?resource-by-url db (:resource_url result)))))]
+    (if-let [cached (find-cached-result! result)]
       (-> state
           (assoc-in [:data :resource] cached)
           (assoc-in [:index :video] 0)
@@ -412,6 +420,8 @@
             (assoc-in [:data :resource] resource)
             (assoc-in [:index :video] 0)
             (update :id inc))))))
+
+; FX
 
 (defn forward! [{:keys [index data] :as state}]
   (let [next-index (inc (:result index))
@@ -597,10 +607,10 @@
   (str/join " " (map str parts)))
 
 (defn welcome-message [{:keys [genre style year] :as _params}]
-  (let [parts (cond-> ["Welcome! Querying Discogs for genre" (green (str/capitalize genre))]
-                style (into ["in style" (green (str/capitalize style))])
-                year  (into ["from" (green year)]))]
-    (apply line parts)))
+  (let [prefix "Welcome! Querying Discogs for genre"]
+    (cond-> (line prefix (green (str/capitalize genre)))
+      style (line "in style" (green (str/capitalize style)))
+      year  (line "from" (green year)))))
 
 (defn welcome-lines [{:keys [params index]}]
   [(welcome-message params)
@@ -614,19 +624,30 @@
 
 (def instruction-lines
   (cond-> [""
-           (line (blue "[?]") "Press" (yellow "n") "for next release," (yellow "p") "for previous," (yellow "q") "to quit.")
-           (line "   " "To navigate videos, press" (yellow "j") "to go down," (yellow "k") "to go up.")
-           (line "   " "Press" (yellow "Enter") "to open video link in the browser.")]
+           (line (blue "[?]")
+                 "Press" (yellow "n") "for next release,"
+                 (yellow "p") "for previous,"
+                 (yellow "q") "to quit.")
+           (line "   "
+                 "To navigate videos, press"
+                 (yellow "j") "to go down,"
+                 (yellow "k") "to go up.")
+           (line "   "
+                 "Press"
+                 (yellow "Enter") "to open a video link in the browser.")]
     mpv-exists?
-    (conj (str "    Press " (yellow "Space") " to play/pause audio."))))
+    (conj (line "   "  "Press" (yellow "Space") "to play/pause audio."))))
 
 (defn index-of-lines [{:keys [index data] :as _state}]
-  (let [index-of (str "(" (inc (:result index)) " of " (count (:results data)) ")")]
+  (let [results-len  (count (:results data))
+        result-index (inc (:result index))
+        index-of     (str "(" result-index " of " results-len ")")]
     [(line "-----------" "Page" (:page index) index-of "-----------")]))
 
 (defn header-lines [{:keys [data params] :as state}]
-  (let [result   (current-result state)
-        resource (:resource data)]
+  (let [result      (current-result state)
+        resource    (:resource data)
+        param-style (str/capitalize (:style params))]
     (cond-> (index-of-lines state)
       :always
       (into [(line "Artists:" (str/join ", " (map :name (:artists resource))))
@@ -634,9 +655,8 @@
              (line "Year:   " (:year resource))
              (line "Master: " (if (:master? resource) "Yes" "No"))
              (line "Page:   " (:uri resource))
-             (line "Exact   "
-                   (if (= #{(str/capitalize (:style params))} (set (:style result)))
-                     "Yes" "No"))
+             (line "Exact   " (if (= #{param-style} (set (:style result)))
+                                "Yes" "No"))
              (line "Have:   " (:have (:community result)))
              (line "Want:   " (:want (:community result)))])
       $conn
@@ -689,13 +709,14 @@
       :else
       (into header (videos-lines state header)))))
 
-(defn session-item-lines [{:keys [genre style year page index] :as session} current?]
+(defn session-item-lines
+  [{:keys [genre style year page index created-at] :as _session} current?]
   [(line (if current? ">" "-")
          "Genre:" (str/capitalize genre) "|"
          "Style:" (str/capitalize style) "|"
          "Year:"  year)
    (line "  Page:" page "-" "Index:" (inc index))
-   (line "  Updated:" (relative-time (:created-at session)))])
+   (line "  Updated:" (relative-time created-at))])
 
 (defn session-list-lines [{:keys [data index] :as _state}]
   (mapcat (fn [idx]
@@ -831,9 +852,9 @@
   (loop []
     (let [input (read-char)]
       (when-not (= input (int \q))
-        (let [state @state*
-              [next fx] (handle-input state input)]
-          (transition! state [next fx])
+        (let [state  @state*
+              result (handle-input state input)]
+          (transition! state result)
           (recur))))))
 
 ;; Process ---------------------------------------------------------------------
