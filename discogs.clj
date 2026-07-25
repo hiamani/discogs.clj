@@ -89,8 +89,9 @@
      :data    {:results  nil
                :resource nil
                :sessions nil}
-     :view    {:key   :init
+     :view    {:key   :view/init
                :props {:status :fetching}}
+     :entry   :entry/default
      :actions {:play-video nil
                :browse-uri nil
                :browse-id  0}}))
@@ -457,20 +458,30 @@
 
       :else state)))
 
+(defn load! [state]
+  (let [state' (fetch-page! state)
+        ok?    (seq (:results (:data state')))]
+    (if ok?
+      (-> state'
+          (set-resource (fetch-current-resource! state'))
+          (assoc :view {:key :view/resources}))
+      (assoc state' :view {:key :view/init :props {:status :error}}))))
+
 (defn init! [state]
   (let [state' (fetch-page! state)
         ok?    (seq (:results (:data state')))]
-    (assoc state' :view {:key :init
+    (assoc state' :view {:key :view/init
                          :props {:status (if ok? :done :error)}})))
 
 ;; Setup
 
 (defn run-effect! [state [effect callback]]
   (cond-> (case effect
-            :init    (init! state)
-            :refetch (set-resource state (fetch-current-resource! state))
-            :forward (forward! state)
-            :back    (back! state))
+            :fx/init    (init! state)
+            :fx/load    (load! state)
+            :fx/refetch (set-resource state (fetch-current-resource! state))
+            :fx/forward (forward! state)
+            :fx/back    (back! state))
     callback (callback)))
 
 ;; Handlers --------------------------------------------------------------------
@@ -485,15 +496,15 @@
 (defn fetch-callback [state]
   (-> state
       (assoc-in [:actions :play-video] nil)
-      (assoc :view {:key :resources})))
+      (assoc :view {:key :view/resources})))
 
 (defn handle-nav-resource [{:keys [view data] :as state} input]
   (if (some? (:results data))
-    (let [init?  (= :init (:key view))
+    (let [init?  (= :view/init (:key view))
           next?  (= input (int \n))]
-      [state (cond init? [:refetch fetch-callback]
-                   next? [:forward fetch-callback]
-                   :else [:back    fetch-callback])])
+      [state (cond init? [:fx/refetch fetch-callback]
+                   next? [:fx/forward fetch-callback]
+                   :else [:fx/back    fetch-callback])])
     [state nil]))
 
 ;; Resources View
@@ -560,8 +571,8 @@
   (let [session (nth (:sessions data) (:session index))]
     (-> state
         (merge-progress session)
-        (assoc :view {:key :init :props {:status :fetching}})
-        (vector [:init]))))
+        (assoc :view {:key :view/init :props {:status :fetching}})
+        (vector [:fx/load]))))
 
 (defn handle-sessions-input [state input]
   (cond
@@ -574,9 +585,9 @@
 
 (defn handle-input [state input]
   (case (:key (:view state))
-    :sessions  (handle-sessions-input state input)
-    :init      (handle-init-input state input)
-    :resources (handle-resources-input state input)
+    :view/sessions  (handle-sessions-input state input)
+    :view/init      (handle-init-input state input)
+    :view/resources (handle-resources-input state input)
     [state nil]))
 
 ;; Display ---------------------------------------------------------------------
@@ -676,10 +687,10 @@
     (conj (line "   "  "Press" (yellow "Space") "to play/pause audio."))))
 
 (defn resource-index-of-lines [{:keys [index data] :as _state}]
-  (let [results-len  (count (:results data))
-        result-index (inc (:result index))
+  (let [result-index (inc (:result index))
+        results-len  (count (:results data))
         index-of     (str "(Release " result-index " of " results-len ")")]
-    [(line "-----------" "Page" (:page index) index-of "-----------")]))
+    [(blue (line "Page" (:page index) index-of))]))
 
 (defn resource-header-lines [{:keys [data index params] :as state}]
   (let [result      (current-result state)
@@ -744,7 +755,8 @@
    (line (blue "[?]")
          "Press" (yellow "j") "for next session,"
          (yellow "k") "for previous,"
-         (yellow "q") "to quit.")])
+         (yellow "q") "to quit.")
+   (line "   " "Press" (yellow "Enter") "to resume sesssion.")])
 
 (defn session-item-title [{:keys [genre style year] :as _session}]
   (str "Genre: " (str/capitalize genre) " | "
@@ -818,9 +830,9 @@
 
 (defn render! [_ _ _ {:keys [view] :as state}]
   (let [lines (case (:key view)
-                :sessions  (sessions-lines state)
-                :init      (init-lines state)
-                :resources (resource-lines state))
+                :view/sessions  (sessions-lines state)
+                :view/init      (init-lines state)
+                :view/resources (resource-lines state))
         frame (str "\033[H" (str/join "\033[K\n" lines) "\033[K\033[J")]
     (print frame)
     (flush)))
@@ -849,12 +861,16 @@
     (cond
       (some? sessions)
       (-> initial-state
-          (assoc :view {:key :sessions})
+          (assoc :view  {:key :view/sessions}
+                 :entry :entry/sessions)
           (assoc-in [:data :sessions] sessions)
           (vector :ok))
 
       (some? progress)
-      [(merge-progress initial-state progress) :ok]
+      (-> initial-state
+          (merge-progress progress)
+          (assoc :entry :entry/resume)
+          (vector :ok))
 
       (or (empty? *command-line-args*) (:help options))
       [nil :no-args]
@@ -915,9 +931,10 @@
 
 (defn main! []
   (mount!)
-  (case (get-in @state* [:view :key])
-    :init     (reset! state* (run-effect! @state* [:init]))
-    :sessions nil
+  (case (:entry @state*)
+    :entry/default   (reset! state* (run-effect! @state* [:fx/init]))
+    :entry/resume    (reset! state* (run-effect! @state* [:fx/load]))
+    :entry/sessions  nil
     nil)
   (read-loop!))
 
