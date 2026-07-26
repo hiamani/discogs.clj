@@ -146,7 +146,8 @@
      :actions {:play-video   nil
                :browse-uri   nil
                :browse-id    0
-               :system/exit! false}}))
+               :system/exit! false}
+     :issues  {:invalid-videos #{}}}))
 
 (def state* (atom initial-state))
 
@@ -752,12 +753,19 @@
   (str "[" (int (/ duration 60)) "m" (format "%02d" (mod duration 60)) "s]"))
 
 (defn video-lines [state idx {:keys [uri title duration] :as _video}]
-  (let [current?  (= idx (:video (:index state)))
-        playing?  (= idx (:play-video (:actions state)))]
+  (let [current? (= idx (:video (:index state)))
+        playing? (= idx (:play-video (:actions state)))
+        invalid? (contains? (:invalid-videos (:issues state)) uri)]
     (cond->> [(line " "   (if current? (str "> " title) (str "- " title)))
-              (line "   " (str (when playing? "▶ ") uri))
+              (line "   " (str (cond invalid? "! "
+                                     playing? "▶ "
+                                     :else    "")
+                               uri))
               (line "   " (video-duration-display duration))]
-      current? (map (comp bold green)))))
+      (and current? (not invalid?))
+      (map (comp bold green))
+      invalid?
+      (map (comp bold red)))))
 
 (defn videos-lines [{:keys [data index] :as state} header-len]
   (let [videos      (:videos (:resource data))
@@ -840,13 +848,24 @@
 
 (defn destroy-player! []
   (when-let [p @player*]
-    (.destroy p)
-    (reset! player* nil)))
+    (reset! player* nil)
+    (.destroy p)))
+
+(defn invalidate-video [state uri]
+  (let [current? (= uri (some-> (current-video state) :uri))]
+    (cond-> state
+      :always  (update-in [:issues :invalid-videos] #(conj % uri))
+      current? (assoc-in [:actions :play-video] nil))))
 
 (defn play-video! [uri]
   (let [args   ["mpv" "--no-video" "--really-quiet" uri]
         player (-> (ProcessBuilder. args) (.start))]
-    (reset! player* player)))
+    (reset! player* player)
+    (future
+      (.waitFor player)
+      (when (and (not (zero? (.exitValue player)))
+                 (identical? player @player*))
+        (swap! state* invalidate-video uri)))))
 
 (defn play! [_ _ prev next]
   (when (not= (:play-video (:actions prev))
