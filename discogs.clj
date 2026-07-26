@@ -14,6 +14,84 @@
 
 (import '[java.time Instant Duration])
 
+;; Common ----------------------------------------------------------------------
+
+;; Text Styles
+
+(defn bold [s] (str "\033[1m" s "\033[0m"))
+
+(defn red [s] (str "\033[31m" s "\033[0m"))
+
+(defn green [s] (str "\033[32m" s "\033[0m"))
+
+(defn yellow [s] (str "\033[33m" s "\033[0m"))
+
+(defn blue [s] (str "\033[34m" s "\033[0m"))
+
+(defn print-error [s]
+  (println (red "[!]") "Error:" s))
+
+(defn print-summary [summary]
+  (println "discogs.clj -- Scrape the Discogs API for release videos")
+  (println summary))
+
+;; CLI Options -----------------------------------------------------------------
+
+;; Validation
+
+(defn validate-args! [{:keys [options summary errors]}]
+  (cond
+    (or (empty? *command-line-args*) (:help options))
+    (do (print-summary summary)
+        (System/exit 0))
+
+    errors
+    (do (run! print-error errors)
+        (print-summary summary)
+        (System/exit 1))
+
+    (every? nil? (select-keys options [:genre :list :resume]))
+    (do (print-error "Please specify a genre")
+        (print-summary summary)
+        (System/exit 1))
+
+    (and (:list options) (:no-database options))
+    (do (print-error "Cannot list sessions without database")
+        (print-summary summary)
+        (System/exit 1))
+
+    (and (:resume options) (:no-database options))
+    (do (print-error "Cannot resume without database")
+        (print-summary summary)
+        (System/exit 1))))
+
+;; Parsing
+
+(defn parse-page [v]
+  (let [n (parse-long v)]
+    (if (and n (< 0 n)) n 1)))
+
+(defn parse-index [v]
+  (let [n (parse-long v)]
+    (if (and n (< 0 n)) (dec n) 0)))
+
+(def cli-config
+  [["-h" "--help"          "Show help"]
+   ["-g" "--genre GENRE"   "Genre (required)"]
+   ["-s" "--style STYLE"   "Style"]
+   ["-y" "--year YEAR"     "Year"]
+   ["-p" "--page PAGE"     "Starting page"  :parse-fn parse-page :default 1]
+   ["-i" "--index INDEX"   "Starting index" :parse-fn parse-index :default 0]
+   ["-r" "--resume"        "Resume last session"]
+   ["-l" "--list"          "List and resume sessions"]
+   ["-d" "--database PATH" "Database path"]
+   ["-x" "--no-database"   "Skip database connection"]])
+
+(def cli-opts
+  (parse-opts *command-line-args* cli-config))
+
+(validate-args! cli-opts)
+
 ;; Processes -------------------------------------------------------------------
 
 (defn try-mpv! []
@@ -49,33 +127,6 @@
 
 ;; State -----------------------------------------------------------------------
 
-;; CLI Options
-
-(defn parse-page [v]
-  (let [n (parse-long v)]
-    (if (and n (< 0 n)) n 1)))
-
-(defn parse-index [v]
-  (let [n (parse-long v)]
-    (if (and n (< 0 n)) (dec n) 0)))
-
-(def cli-config
-  [["-h" "--help"          "Show help"]
-   ["-g" "--genre GENRE"   "Genre (required)"]
-   ["-s" "--style STYLE"   "Style"]
-   ["-y" "--year YEAR"     "Year"]
-   ["-p" "--page PAGE"     "Starting page"  :parse-fn parse-page :default 1]
-   ["-i" "--index INDEX"   "Starting index" :parse-fn parse-index :default 0]
-   ["-r" "--resume"        "Resume last session"]
-   ["-l" "--list"          "List and pick sessions"]
-   ["-d" "--database PATH" "Database path"]
-   ["-x" "--no-database"   "Skip database connection"]])
-
-(def cli-opts
-  (parse-opts *command-line-args* cli-config))
-
-;; State
-
 (def initial-state
   (let [{:keys [genre style year page index]} (:options cli-opts)]
     {:id      0
@@ -92,9 +143,10 @@
      :view    {:key   :view/init
                :props {:status :fetching}}
      :entry   :entry/default
-     :actions {:play-video nil
-               :browse-uri nil
-               :browse-id  0}}))
+     :actions {:play-video   nil
+               :browse-uri   nil
+               :browse-id    0
+               :system/exit! false}}))
 
 (def state* (atom initial-state))
 
@@ -459,19 +511,22 @@
       :else state)))
 
 (defn load! [state]
-  (let [state' (fetch-page! state)
-        ok?    (seq (:results (:data state')))]
-    (if ok?
+  (let [state' (fetch-page! state)]
+    (if (seq (:results (:data state')))
       (-> state'
           (set-resource (fetch-current-resource! state'))
           (assoc :view {:key :view/resources}))
-      (assoc state' :view {:key :view/init :props {:status :error}}))))
+      (-> state'
+          (assoc :view {:key :view/init :props {:status :error}})
+          (assoc-in [:actions :system/exit!] true)))))
 
 (defn init! [state]
   (let [state' (fetch-page! state)
-        ok?    (seq (:results (:data state')))]
-    (assoc state' :view {:key :view/init
-                         :props {:status (if ok? :done :error)}})))
+        ok?    (seq (:results (:data state')))
+        status (if ok? :done :error)]
+    (-> state'
+        (assoc :view {:key :view/init :props {:status status}})
+        (assoc-in [:actions :system/exit!] (not ok?)))))
 
 ;; Setup
 
@@ -592,27 +647,6 @@
 
 ;; Display ---------------------------------------------------------------------
 
-;; Text Styles
-
-(defn bold [s] (str "\033[1m" s "\033[0m"))
-
-(defn red [s] (str "\033[31m" s "\033[0m"))
-
-(defn green [s] (str "\033[32m" s "\033[0m"))
-
-(defn yellow [s] (str "\033[33m" s "\033[0m"))
-
-(defn blue [s] (str "\033[34m" s "\033[0m"))
-
-;; Printing
-
-(defn print-error [s]
-  (println (red "[!]") "Error:" s))
-
-(defn print-summary [summary]
-  (println "discogs.clj -- Scrape the Discogs API for release videos")
-  (println summary))
-
 ;; Helpers
 
 (defn line [& parts]
@@ -656,16 +690,17 @@
                  (yellow "q") "to quit.")]))
 
 (def init-statuses
-  {:fetching (line (green ">") "Fetching initial results...")
-   :done     (line (green ">") "Fetching initial results... Done!")
-   :error    (line (red "[!]") "No initial results!")})
+  {:fetching [(line (green ">") "Fetching initial results...")]
+   :done     [(line (green ">") "Fetching initial results... Done!")]
+   :error    [(line)
+              (line (red "[!]") "No results found! Exiting")]})
 
 (defn init-lines [state]
   (let [status (-> state :view :props :status)]
     (cond-> (welcome-lines state)
       (not mpv-exists?)
       (conj (red "> mpv not found - audio playback disabled"))
-      (some? status)   (conj (get init-statuses status))
+      (some? status)   (into (get init-statuses status))
       (= :done status) (into init-instructions-lines))))
 
 ;; Resource Lines
@@ -756,7 +791,7 @@
          "Press" (yellow "j") "for next session,"
          (yellow "k") "for previous,"
          (yellow "q") "to quit.")
-   (line "   " "Press" (yellow "Enter") "to resume sesssion.")])
+   (line "   " "Press" (yellow "Enter") "to resume session.")])
 
 (defn session-item-title [{:keys [genre style year] :as _session}]
   (str "Genre: " (str/capitalize genre) " | "
@@ -837,13 +872,21 @@
     (print frame)
     (flush)))
 
+;; System
+
+(defn system! [_ _ _ next]
+  (when (:system/exit! (:actions next))
+    (println)
+    (System/exit 1)))
+
 ;; Setup
 
 (defn watch! []
   (add-watch state* ::browse browse!)
   (add-watch state* ::play   play!)
   (add-watch state* ::save   save-progress!)
-  (add-watch state* ::render render!))
+  (add-watch state* ::render render!)
+  (add-watch state* ::system system!))
 
 ;; Initialization --------------------------------------------------------------
 
@@ -859,12 +902,14 @@
   (let [sessions (resolve-sessions! options)
         progress (when-not sessions (resolve-progress! options))]
     (cond
-      (some? sessions)
+      (seq sessions)
       (-> initial-state
-          (assoc :view  {:key :view/sessions}
-                 :entry :entry/sessions)
+          (assoc :view {:key :view/sessions} :entry :entry/sessions)
           (assoc-in [:data :sessions] sessions)
           (vector :ok))
+
+      (:list options)
+      [nil :error "No saved sessions found"]
 
       (some? progress)
       (-> initial-state
@@ -872,17 +917,8 @@
           (assoc :entry :entry/resume)
           (vector :ok))
 
-      (or (empty? *command-line-args*) (:help options))
-      [nil :no-args]
-
-      (:errors options)
-      [nil :error (:errors options)]
-
       (:resume options)
-      [nil :error ["No progress found in database, cannot resume"]]
-
-      (nil? (:genre options))
-      [nil :error ["Please specify a genre"]]
+      [nil :error "No progress found in database, cannot resume"]
 
       :else
       [initial-state :ok])))
@@ -897,11 +933,12 @@
 (defn read-loop! []
   (loop []
     (let [input (read-char)]
-      (when-not (= input (int \q))
+      (if-not (= input (int \q))
         (let [state  @state*
               result (handle-input state input)]
           (transition! state result)
-          (recur))))))
+          (recur))
+        (println)))))
 
 ;; Process ---------------------------------------------------------------------
 
@@ -920,20 +957,18 @@
 ;; Main
 
 (defn mount! []
-  (let [[state status errors] (resolve-state! cli-opts)]
+  (let [[state status error] (resolve-state! cli-opts)]
     (case status
-      :no-args (do (print-summary (:summary cli-opts))
-                   (System/exit 0))
-      :error   (do (run! print-error errors)
-                   (print-summary (:summary cli-opts))
-                   (System/exit 1))
-      :ok      (do (watch!) (reset! state* state)))))
+      :ok    (do (watch!) (reset! state* state))
+      :error (do (print-error error)
+                 (print-summary (:summary cli-opts))
+                 (System/exit 1)))))
 
 (defn main! []
   (mount!)
   (case (:entry @state*)
-    :entry/default   (reset! state* (run-effect! @state* [:fx/init]))
-    :entry/resume    (reset! state* (run-effect! @state* [:fx/load]))
+    :entry/default   (swap! state* #(run-effect! % [:fx/init]))
+    :entry/resume    (swap! state* #(run-effect! % [:fx/load]))
     :entry/sessions  nil
     nil)
   (read-loop!))
