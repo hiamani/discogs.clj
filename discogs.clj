@@ -142,7 +142,7 @@
                :sessions nil}
      :view    {:key   :view/init
                :props {:status :fetching}}
-     :entry   :entry/default
+     :entry   :entry/init
      :actions {:play-video   nil
                :browse-uri   nil
                :browse-id    0
@@ -396,6 +396,21 @@
 
 ;; Helpers ---------------------------------------------------------------------
 
+(defn relative-time [date]
+  (let [then (.toInstant date)
+        secs (.getSeconds (Duration/between then (Instant/now)))
+        mins (quot secs 60)
+        hrs  (quot mins 60)
+        days (quot hrs 24)]
+    (cond
+      (< secs 60)  "just now"
+      (< mins 60)  (str mins "m ago")
+      (< hrs 24)   (str hrs "h ago")
+      (< days 7)   (str days "d ago")
+      (< days 30)  (str (quot days 7) "w ago")
+      (< days 365) (str (quot days 30) "mo ago")
+      :else        (str (quot days 365) "y ago"))))
+
 (defn current-result [{:keys [data index] :as _state}]
   (nth (:results data) (:result index) nil))
 
@@ -412,21 +427,6 @@
       (assoc-in [:params :genre]  (:genre progress))
       (assoc-in [:params :style]  (:style progress))
       (assoc-in [:params :year]   (:year progress))))
-
-(defn relative-time [date]
-  (let [then (.toInstant date)
-        secs (.getSeconds (Duration/between then (Instant/now)))
-        mins (quot secs 60)
-        hrs  (quot mins 60)
-        days (quot hrs 24)]
-    (cond
-      (< secs 60)  "just now"
-      (< mins 60)  (str mins "m ago")
-      (< hrs 24)   (str hrs "h ago")
-      (< days 7)   (str days "d ago")
-      (< days 30)  (str (quot days 7) "w ago")
-      (< days 365) (str (quot days 30) "mo ago")
-      :else        (str (quot days 365) "y ago"))))
 
 ;; Effects ---------------------------------------------------------------------
 
@@ -458,7 +458,7 @@
 ;; Cache Helper
 
 (defn find-cached-result! [result]
-  (when (and $conn result)
+  (when $conn
     (let [db (d/db $conn)]
       (or (?resource-by-url db (:master_url result))
           (?resource-by-url db (:resource_url result))))))
@@ -466,9 +466,9 @@
 ;; Resource Helpers
 
 (defn fetch-current-resource! [state]
-  (let [result (current-result state)]
+  (when-let [result (current-result state)]
     (or (find-cached-result! result)
-        (when-let [resource (some-> result (fetch-resource!))]
+        (when-let [resource (fetch-resource! result)]
           (some-> $conn (transact-resource! resource))
           resource))))
 
@@ -986,7 +986,7 @@
 (defn main! []
   (mount!)
   (case (:entry @state*)
-    :entry/default   (swap! state* #(run-effect! % [:fx/init]))
+    :entry/init      (swap! state* #(run-effect! % [:fx/init]))
     :entry/resume    (swap! state* #(run-effect! % [:fx/load]))
     :entry/sessions  nil
     nil)
@@ -995,3 +995,6 @@
 ;; Run
 
 (main!)
+
+;; \(^.^)/
+;; Have fun!
